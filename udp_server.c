@@ -1,20 +1,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 
+static volatile bool force_quit;
+
 #define PORT 8888
 #define MAXLINE 1024
 
-int main() {
-    int sockfd; 
+int sockfd;
+
+static void signal_handler(int signum) {
+	if (signum == SIGINT || signum == SIGTERM) {
+		printf("\n\nSignal %d received, preparing to exit...\n", signum);
+        close(sockfd);
+		force_quit = true;
+        exit(0);
+	}
+}
+
+int main() { 
     char buffer[MAXLINE];
     struct sockaddr_in servaddr, cliaddr;
     socklen_t len;
+
+    force_quit = false;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
     // Create a UDP socket
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -38,7 +56,7 @@ int main() {
 
     printf("UDP Server is listening on port %d...\n", PORT);
 
-    while (1) {
+    while (!force_quit) {
         // Receive a UDP packet
         len = sizeof(cliaddr);
         int n = recvfrom(sockfd, (char *)buffer, MAXLINE, 0, (struct sockaddr *)&cliaddr, &len);
@@ -55,7 +73,7 @@ int main() {
         memset(buffer, 0, sizeof(buffer));
     }
 
-    // Close the socket (never reached in this infinite loop)
+    // Close the socket
     close(sockfd);
 
     return 0;
