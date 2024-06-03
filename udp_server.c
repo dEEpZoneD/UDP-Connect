@@ -1,15 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-
-static volatile bool force_quit;
 
 #define PORT 8888
 #define MAXLINE 1024
@@ -20,7 +17,6 @@ static void signal_handler(int signum) {
 	if (signum == SIGINT || signum == SIGTERM) {
 		printf("\n\nSignal %d received, preparing to exit...\n", signum);
         close(sockfd);
-		force_quit = true;
         exit(0);
 	}
 }
@@ -30,7 +26,6 @@ int main() {
     struct sockaddr_in servaddr, cliaddr;
     socklen_t len;
 
-    force_quit = false;
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
@@ -56,7 +51,7 @@ int main() {
 
     printf("UDP Server is listening on port %d...\n", PORT);
 
-    while (!force_quit) {
+    while (1) {
         // Receive a UDP packet
         len = sizeof(cliaddr);
         int n = recvfrom(sockfd, (char *)buffer, MAXLINE, 0, (struct sockaddr *)&cliaddr, &len);
