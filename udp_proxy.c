@@ -20,6 +20,33 @@
 #define PORT 4443
 #define BUF_SIZE 1024
 
+static FILE *s_log_fh;
+
+static int
+tut_log_buf (void *ctx, const char *buf, size_t len)
+{
+    FILE *out = ctx;
+    fwrite(buf, 1, len, out);
+    fflush(out);
+    return 0;
+}
+static const struct lsquic_logger_if logger_if = { tut_log_buf, };
+
+static int s_verbose;
+static void
+LOG (const char *fmt, ...)
+{
+    if (s_verbose)
+    {
+        va_list ap;
+        fprintf(s_log_fh, "LOG: ");
+        va_start(ap, fmt);
+        (void) vfprintf(s_log_fh, fmt, ap);
+        va_end(ap);
+        fprintf(s_log_fh, "\n");
+    }
+}
+
 union {
     struct sockaddr     sa;
     struct sockaddr_in  addr4;
@@ -89,10 +116,11 @@ int main(int argc, char** argv) {
     
     struct sockaddr* local_addr;
 
-    if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER)) {
+    if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER|LSQUIC_GLOBAL_CLIENT)) {
         exit(EXIT_FAILURE);
     }
 
+    memset(&engine_api, 0, sizeof(engine_api));
     // int flags;
 
     // flags = fcntl(fd, F_GETFL);
@@ -113,7 +141,11 @@ int main(int argc, char** argv) {
     signal(SIGTERM, signal_handler);
 
     lsquic_engine_t *engine = lsquic_engine_new(LSENG_SERVER|LSENG_HTTP, &engine_api);
-    
+    if (!engine) {
+        fprintf(stderr, "cannot create engine\n");
+        exit(EXIT_FAILURE);
+    }
+
     int lsquic_engine_packet_in (lsquic_engine_t *,
         const unsigned char *udp_payload, size_t sz,
         const struct sockaddr *sa_local,
