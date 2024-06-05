@@ -28,7 +28,6 @@ my_log_buf (void *ctx, const char *buf, size_t len)
 }
 static const struct lsquic_logger_if logger_if = { my_log_buf, };
 
-
 static int s_verbose;
 static void
 LOG (const char *fmt, ...)
@@ -44,24 +43,26 @@ LOG (const char *fmt, ...)
     }
 }
 
-// static lsquic_conn_ctx_t *my_client_on_new_conn(struct lsquic_conn *conn) {}
-// static void my_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status) {}
-// static void my_client_on_conn_closed (struct lsquic_conn *conn) {}
-// static lsquic_stream_ctx_t *my_client_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream) {}
-// static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {}
-// static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {}
-// static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {}
+static int cli_packets_out();
 
-// static struct lsquic_streamy_m_if my_client_callbacks =
-// {
-//     .on_new_conn        = my_client_on_new_conn,
-//     .on_hsk_done        = my_client_on_hsk_done,
-//     .on_conn_closed     = my_client_on_conn_closed,
-//     .on_new_stream      = my_client_on_new_stream,
-//     .on_read            = my_client_on_read,
-//     .on_write           = my_client_on_write,
-//     .on_close           = my_client_on_close,
-// };
+static lsquic_conn_ctx_t *my_client_on_new_conn(struct lsquic_conn *conn);
+static void my_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status);
+static void my_client_on_conn_closed (struct lsquic_conn *conn);
+static lsquic_stream_ctx_t *my_client_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream);
+static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
+static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
+static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
+
+static struct lsquic_stream_if my_client_callbacks =
+{
+    .on_new_conn        = my_client_on_new_conn,
+    .on_hsk_done        = my_client_on_hsk_done,
+    .on_conn_closed     = my_client_on_conn_closed,
+    .on_new_stream      = my_client_on_new_stream,
+    .on_read            = my_client_on_read,
+    .on_write           = my_client_on_write,
+    .on_close           = my_client_on_close,
+};
 
 union {
     struct sockaddr     sa;
@@ -126,22 +127,44 @@ static void signal_handler(int signum) {
 
 int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
+    struct lsquic_engine_settings settings;
     s_log_fh = stderr;
-    if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER|LSQUIC_GLOBAL_CLIENT)) {
+    char errbuf[0x100];
+
+    if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
         fprintf(stderr, "Lsquic global initialisation failed");
         exit(EXIT_FAILURE);
     }
-
     argument_parser(argc, argv);
 
     setvbuf(s_log_fh, NULL, _IOLBF, 0);
     lsquic_logger_init(&logger_if, s_log_fh, LLTS_HHMMSSUS);
 
+    lsquic_engine_init_settings(&settings, LSENG_HTTP);
+    settings.es_ql_bits = 0;
+
+    if (0 != lsquic_engine_check_settings(&settings,
+                            LSENG_HTTP,
+                            errbuf, sizeof(errbuf)))
+    {
+        LOG("invalid settings: %s", errbuf);
+        exit(EXIT_FAILURE);
+    }
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    lsquic_engine_t* engine = lsquic_engine_new(LSENG_SERVER|LSENG_HTTP, &engine_api);
+    
+    
+    memset(&engine_api, 0, sizeof(engine_api));
+    engine_api.ea_packets_out = cli_packets_out;
+    engine_api.ea_packets_out_ctx = NULL;
+    engine_api.ea_stream_if = my_client_callbacks;
+    engine_api.ea_stream_if_ctx = NULL;
+    engine_api.ea_settings = &settings;
+
+    lsquic_engine_t* engine = lsquic_engine_new(LSENG_HTTP, &engine_api);
     if (!engine) {
-        fprintf(stderr, "cannot create engine\n");
+        LOG("cannot create engine\n");
         exit(EXIT_FAILURE);
     }
     // lsquic_conn_close(conn);
