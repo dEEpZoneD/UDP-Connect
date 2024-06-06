@@ -16,7 +16,15 @@
 
 #include "lsquic.h"
 
-static FILE *s_log_fh;
+#define PROXY_PORT 443
+#define TARGET_PORT 8888
+
+static FILE *log_file;
+
+typedef struct
+{
+    lsquic_engine_t *cli_engine;
+}cli;
 
 static int
 my_log_buf (void *ctx, const char *buf, size_t len)
@@ -28,18 +36,18 @@ my_log_buf (void *ctx, const char *buf, size_t len)
 }
 static const struct lsquic_logger_if logger_if = { my_log_buf, };
 
-static int s_verbose;
+static int s_verbose = 0;
 static void
 LOG (const char *fmt, ...)
 {
     if (s_verbose)
     {
         va_list ap;
-        fprintf(s_log_fh, "LOG: ");
+        fprintf(log_file, "LOG: ");
         va_start(ap, fmt);
-        (void) vfprintf(s_log_fh, fmt, ap);
+        (void) vfprintf(log_file, fmt, ap);
         va_end(ap);
-        fprintf(s_log_fh, "\n");
+        fprintf(log_file, "\n");
     }
 }
 
@@ -50,8 +58,17 @@ static void my_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status s
 static void my_client_on_conn_closed (struct lsquic_conn *conn);
 static lsquic_stream_ctx_t *my_client_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream);
 static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
-static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
-static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
+static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+    lsquic_conn_t *conn;
+    cli *cli;
+    ssize_t nw;
+    conn = lsquic_stream_conn(stream);cli = (void *) lsquic_conn_get_ctx(conn);
+
+    nw = lsquic_stream_write(stream, tut->tut_u.c.buf, tut->tut_u.c.sz);
+}
+static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+    LOG("stream closed");
+}
 
 static struct lsquic_stream_if my_client_callbacks =
 {
@@ -84,11 +101,14 @@ union {
 
 void argument_parser(int argc, char** argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "f:p:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "vf:p:t:")) != -1) {
         switch(opt) {
+            case 'v':
+                s_verbose = 1;
+                break;
             case 'f':
-                s_log_fh = fopen(optarg, "ab");
-                if (!s_log_fh)
+                log_file = fopen(optarg, "ab");
+                if (!log_file)
                 {
                     perror("cannot open log file for writing");
                     exit(EXIT_FAILURE);
@@ -128,7 +148,7 @@ static void signal_handler(int signum) {
 int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
     struct lsquic_engine_settings settings;
-    s_log_fh = stderr;
+    log_file = stderr;
     char errbuf[0x100];
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
@@ -137,16 +157,14 @@ int main(int argc, char** argv) {
     }
     argument_parser(argc, argv);
 
-    setvbuf(s_log_fh, NULL, _IOLBF, 0);
-    lsquic_logger_init(&logger_if, s_log_fh, LLTS_HHMMSSUS);
+    setvbuf(log_file, NULL, _IOLBF, 0);
+    lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
 
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
     settings.es_ql_bits = 0;
 
-    if (0 != lsquic_engine_check_settings(&settings,
-                            LSENG_HTTP,
-                            errbuf, sizeof(errbuf)))
-    {
+    if (0 != lsquic_engine_check_settings(&settings, LSENG_HTTP,
+    errbuf, sizeof(errbuf))) {
         LOG("invalid settings: %s", errbuf);
         exit(EXIT_FAILURE);
     }
@@ -154,7 +172,7 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    
+
     memset(&engine_api, 0, sizeof(engine_api));
     engine_api.ea_packets_out = cli_packets_out;
     engine_api.ea_packets_out_ctx = NULL;

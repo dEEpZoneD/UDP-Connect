@@ -20,7 +20,7 @@
 #define PORT 4443
 #define BUF_SIZE 1024
 
-static FILE *s_log_fh;
+static FILE *log_file;
 
 static int
 tut_log_buf (void *ctx, const char *buf, size_t len)
@@ -39,13 +39,62 @@ LOG (const char *fmt, ...)
     if (s_verbose)
     {
         va_list ap;
-        fprintf(s_log_fh, "LOG: ");
+        fprintf(log_file, "LOG: ");
         va_start(ap, fmt);
-        (void) vfprintf(s_log_fh, fmt, ap);
+        (void) vfprintf(log_file, fmt, ap);
         va_end(ap);
-        fprintf(s_log_fh, "\n");
+        fprintf(log_file, "\n");
     }
 }
+
+typedef struct
+{
+    struct lsquic_conn_ctx *conn_ctx;
+    lsquic_engine_t *engine;
+    unsigned max_conn;
+    unsigned n_conn;
+    unsigned n_curr_conn;
+    unsigned delay_resp_sec;    
+}server_ctx;
+
+struct lsquic_conn_ctx
+{
+    lsquic_conn_t *conn;
+    struct server_ctx *server_ctx;
+
+};
+
+static int server_packets_out();
+static int server_packets_in();
+
+static lsquic_conn_ctx_t *server_on_new_conn(struct lsquic_conn *conn);
+static void server_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status);
+static void server_on_conn_closed (struct lsquic_conn *conn);
+static lsquic_stream_ctx_t *server_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream);
+static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
+static void server_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+    lsquic_conn_t *conn;
+    server_ctx *server_ctx;
+    ssize_t nw;
+    conn = lsquic_stream_conn(stream);
+    server_ctx = (void *) lsquic_conn_get_ctx(conn);
+
+    nw = lsquic_stream_write(stream, tut->tut_u.c.buf, tut->tut_u.c.sz);
+}
+static void server_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+    LOG("stream closed");
+}
+
+static struct lsquic_stream_if my_client_callbacks =
+{
+    .on_new_conn        = server_on_new_conn,
+    .on_hsk_done        = server_on_hsk_done,
+    .on_conn_closed     = server_on_conn_closed,
+    .on_new_stream      = server_on_new_stream,
+    .on_read            = server_on_read,
+    .on_write           = server_on_write,
+    .on_close           = server_on_close,
+};
 
 union {
     struct sockaddr     sa;
