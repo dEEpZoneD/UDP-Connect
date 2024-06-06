@@ -23,8 +23,11 @@ static FILE *log_file;
 
 typedef struct
 {
-    lsquic_engine_t *cli_engine;
-}cli;
+    const char *hostname;
+    const char *method;
+    const char *payload;
+    char payload_sizep[20];
+}client_ctx;
 
 static int
 my_log_buf (void *ctx, const char *buf, size_t len)
@@ -51,9 +54,12 @@ LOG (const char *fmt, ...)
     }
 }
 
-static int cli_packets_out();
+// static int cli_packets_out();
 
-static lsquic_conn_ctx_t *my_client_on_new_conn(struct lsquic_conn *conn);
+static lsquic_conn_ctx_t *my_client_on_new_conn(void *stream_if_ctx, struct lsquic_conn *conn) {
+    client_ctx client_ctc = stream_if_ctx;
+    
+}
 static void my_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status);
 static void my_client_on_conn_closed (struct lsquic_conn *conn);
 static lsquic_stream_ctx_t *my_client_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream);
