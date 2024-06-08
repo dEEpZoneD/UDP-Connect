@@ -64,10 +64,12 @@ struct lsquic_conn_ctx
 
 };
 
-static int server_packets_out();
-static int server_packets_in();
+// static int server_packets_out();
+// static int server_packets_in();
 
-static lsquic_conn_ctx_t *server_on_new_conn(struct lsquic_conn *conn);
+static lsquic_conn_ctx_t *server_on_new_conn(void *stream_if_ctx, struct lsquic_conn *conn) {
+    client_ctx 
+}
 static void server_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status);
 static void server_on_conn_closed (struct lsquic_conn *conn);
 static lsquic_stream_ctx_t *server_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream);
