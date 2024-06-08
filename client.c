@@ -27,6 +27,7 @@ static FILE *log_file;
 
 typedef struct
 {
+    lsquic_engine_t *engine;
     const char *hostname;
     const char *method;
     const char *payload;
@@ -273,23 +274,25 @@ static struct lsquic_stream_if my_client_callbacks =
     .on_close           = my_client_on_close,
 };
 
-union {
-    struct sockaddr     sa;
-    struct sockaddr_in  addr4;
-    struct sockaddr_in6 addr6;
-} proxy_addr;
+// union {
+//     struct sockaddr     sa;
+//     struct sockaddr_in  addr4;
+//     struct sockaddr_in6 addr6;
+// } proxy_addr;
 
-union {
-    struct sockaddr     sa;
-    struct sockaddr_in  addr4;
-    struct sockaddr_in6 addr6;
-} local_addr;
+// union {
+//     struct sockaddr     sa;
+//     struct sockaddr_in  addr4;
+//     struct sockaddr_in6 addr6;
+// } local_addr;
 
-union {
-    struct sockaddr     sa;
-    struct sockaddr_in  addr4;
-    struct sockaddr_in6 addr6;
-} target_addr;
+// union {
+//     struct sockaddr     sa;
+//     struct sockaddr_in  addr4;
+//     struct sockaddr_in6 addr6;
+// } target_addr;
+struct sockaddr_in proxy_sa;
+struct sockaddr_in target_sa;
 
 void argument_parser(int argc, char** argv) {
     int opt;
@@ -307,17 +310,17 @@ void argument_parser(int argc, char** argv) {
                 }
                 break;
             case 'p':
-                if (inet_pton(AF_INET, optarg, &proxy_addr.addr4) != 1) {
-                    fprintf(stderr, "Invalid IP address <%s>\n", optarg);
+                if (inet_pton(AF_INET, optarg, &proxy_sa.sin_addr) != 1) {
+                    fprintf(stderr, "Invalid proxy server IP address <%s>\n", optarg);
                     exit(EXIT_FAILURE);
                 }
-                char ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &proxy_addr.addr4, ip_str, INET_ADDRSTRLEN);
-                printf("%s\n", ip_str);
+                // char ip_str[INET_ADDRSTRLEN];
+                // inet_ntop(AF_INET, &proxy_addr.addr4, ip_str, INET_ADDRSTRLEN);
+                // printf("%s\n", ip_str);
                 break;
             case 't':
-                if (inet_pton(AF_INET, optarg, &target_addr.addr4) != 1) {
-                    fprintf(stderr, "Invalid IP address %s\n", optarg);
+                if (inet_pton(AF_INET, optarg, &target_sa.sin_addr) != 1) {
+                    fprintf(stderr, "Invalid target server IP address <%s>\n", optarg);
                     exit(EXIT_FAILURE);
                 }
                 break;
@@ -340,8 +343,21 @@ static void signal_handler(int signum) {
 int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
     struct lsquic_engine_settings settings;
+    proxy_client_ctx client_ctx;
     log_file = stderr;
     char errbuf[0x100];
+
+    struct sockaddr_in local_sa;
+    memset(&local_sa, 0, sizeof(local_sa));
+    local_sa.sin_family = AF_INET;
+    local_sa.sin_addr.s_addr = inet_addr("192.168.122.125");
+    local_sa.sin_port = 443;
+
+    memset(&target_sa, 0, sizeof(target_sa));
+    memset(&proxy_sa, 0, sizeof(proxy_sa));
+    proxy_sa.sin_family = AF_INET;
+    proxy_sa.sin_addr.s_addr = inet_addr("142.250.191.78");  /*www.google.com*/
+    proxy_sa.sin_port = 443;
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
         fprintf(stderr, "Lsquic global initialisation failed");
@@ -372,13 +388,39 @@ int main(int argc, char** argv) {
     engine_api.ea_stream_if_ctx = NULL;
     engine_api.ea_settings = &settings;
 
-    lsquic_engine_t* engine = lsquic_engine_new(LSENG_HTTP, &engine_api);
-    if (!engine) {
+    client_ctx.engine = lsquic_engine_new(LSENG_HTTP, &engine_api);
+    if (!client_ctx.engine) {
         LOG("cannot create engine\n");
         exit(EXIT_FAILURE);
     }
+
+    lsquic_conn_t *conn;
+    const char *server_name = "www.google.com"; // Or the server's IP
+    int server_port = 443; // Default for HTTPS
+
+    /*lsquic_conn_t *lsquic_engine_connect(lsquic_engine_t *engine, enum lsquic_
+        version version, const struct sockaddr *local_sa, const struct sockaddr *peer_sa, 
+        void *peer_ctx, lsquic_conn_ctx_t *conn_ctx, const char *sni, unsigned short base_plpmtu, 
+        const unsigned char *sess_resume, size_t sess_resume_len, const unsigned char *token, 
+        size_t token_sz) */
+
+    conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &local_sa, &proxy_sa, NULL,
+                                    &conn, NULL, NULL, NULL, NULL, NULL, NULL);
+    
+
+    // lsquic_stream_t *stream = lsquic_conn_make_stream(conn);
+    // lsquic_stream_wantwrite(stream, 1);
+    
+    // ... send request in your `on_write` callback...
+
+    // int ev;
+    // while ((ev = lsquic_engine_process_conns(engine)) >= 0) {
+    // }
+
+
     // lsquic_conn_close(conn);
-    // lsquic_engine_destroy(engine);
+    lsquic_engine_destroy(client_ctx.engine);
+    // free(&client_ctx);
     lsquic_global_cleanup();
     return 0;
 }
