@@ -4,6 +4,8 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <errno.h>
+#include <event2/event.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <arpa/inet.h>
@@ -16,6 +18,15 @@
 #include <openssl/err.h>
 
 #include "lsquic.h"
+#include "../src/liblsquic/lsquic_hash.h"
+#include "../src/liblsquic/lsquic_logger.h"
+#include "../src/liblsquic/lsquic_int_types.h"
+#include "../src/liblsquic/lsquic_util.h"
+#include "lsxpack_header.h"
+// #include "test_config.h"
+// #include "test_common.h"
+// #include "test_cert.h"
+// #include "prog.h"
 
 #define PORT 4443
 #define BUF_SIZE 1024
@@ -47,31 +58,87 @@ LOG (const char *fmt, ...)
     }
 }
 
-typedef struct
+struct server_ctx
 {
-    struct lsquic_conn_ctx *conn_ctx;
+    struct lsquic_conn_ctx  *conn_h;
     lsquic_engine_t *engine;
+    struct prog *prog;
     unsigned max_conn;
     unsigned n_conn;
-    unsigned n_curr_conn;
+    unsigned n_current_conns;
     unsigned delay_resp_sec;    
-}server_ctx;
+};
 
 struct lsquic_conn_ctx
 {
     lsquic_conn_t *conn;
     struct server_ctx *server_ctx;
-
+    enum {
+        RECEIVED_GOAWAY = 1 << 0,
+    }                    flags;
 };
 
 // static int server_packets_out();
 // static int server_packets_in();
 
 static lsquic_conn_ctx_t *server_on_new_conn(void *stream_if_ctx, struct lsquic_conn *conn) {
-    client_ctx 
+    struct server_ctx *server_ctx = stream_if_ctx;
+    const char *sni;
+
+    sni = lsquic_conn_get_sni(conn);
+    LSQ_DEBUG("new connection, SNI: %s", sni ? sni : "<not set>");
+
+    lsquic_conn_ctx_t *conn_h = malloc(sizeof(*conn_h));
+    conn_h->conn = conn;
+    conn_h->server_ctx = server_ctx;
+    server_ctx->conn_h = conn_h;
+    ++server_ctx->n_current_conns;
+    return conn_h;
+
 }
+
+static void
+server_on_goaway (lsquic_conn_t *conn)
+{
+    lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
+    conn_h->flags |= RECEIVED_GOAWAY;
+    LSQ_INFO("received GOAWAY");
+}
+
 static void server_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status);
-static void server_on_conn_closed (struct lsquic_conn *conn);
+
+static void server_on_conn_closed (struct lsquic_conn *conn) {
+    static int stopped;
+    lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
+    LSQ_INFO("Connection closed");
+    --conn_h->server_ctx->n_current_conns;
+    if ((conn_h->server_ctx->prog->prog_flags & PROG_FLAG_COOLDOWN)
+                                && 0 == conn_h->server_ctx->n_current_conns)
+    {
+        if (!stopped)
+        {
+            stopped = 1;
+            prog_stop(conn_h->server_ctx->prog);
+        }
+    }
+    if (conn_h->server_ctx->max_conn > 0)
+    {
+        ++conn_h->server_ctx->n_conn;
+        LSQ_NOTICE("Connection closed, remaining: %d",
+                   conn_h->server_ctx->max_conn - conn_h->server_ctx->n_conn);
+        if (conn_h->server_ctx->n_conn >= conn_h->server_ctx->max_conn)
+        {
+            if (!stopped)
+            {
+                stopped = 1;
+                prog_stop(conn_h->server_ctx->prog);
+            }
+        }
+    }
+    /* No provision is made to stop HTTP server */
+    lsquic_conn_set_ctx(conn, NULL);
+    free(conn_h);
+}
 static lsquic_stream_ctx_t *server_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream);
 static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
 static void server_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {

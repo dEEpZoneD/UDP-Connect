@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <assert.h>
 #include <errno.h>
+
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <arpa/inet.h>
@@ -17,24 +18,33 @@
 #include <openssl/err.h>
 
 #include "lsquic.h"
+#include "lsxpack_header.h"
 
-#define PROXY_PORT 443
+#define HTTP_PORT 443
 #define TARGET_PORT 8888
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 static FILE *log_file;
 
+struct lsquic_http_headers headers;
+
 typedef struct
 {
     lsquic_engine_t *engine;
-    const char *hostname;
-    const char *method;
-    const char *payload;
     char payload_sizep[20];
+    int sockfd;
+    struct sockaddr_in local_sa;
+    struct sockaddr_storage local_sas;
     struct lsquic_conn *conn;
     size_t              sz;         /* Size of bytes read is stored here */
     char                buf[0x100]; /* Read up to this many bytes */
+    const char *method;
+    const char *path;
+    const char *protocol;
+    const char *scheme;
+    const char *authority;
+    const char *payload;
 }proxy_client_ctx;
 
 struct lsquic_conn_ctx {
@@ -91,23 +101,17 @@ static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spe
     unsigned n;
     int fd, s = 0;
     struct msghdr msg;
-    // enum ctl_what cw;
-    // union {
-    //     /* cmsg(3) recommends union for proper alignment */
-    //     unsigned char buf[
-    //         CMSG_SPACE(MAX(sizeof(struct in_pktinfo),
-    //             sizeof(struct in6_pktinfo))) + CMSG_SPACE(sizeof(int))
-    //     ];
-    struct cmsghdr cmsg;
-    // } ancil;
 
     if (0 == count)
         return 0;
 
     n = 0;
-    msg.msg_flags = 0;
+    msg.msg_flags      = 0;
+    msg.msg_control    = NULL;
+    msg.msg_controllen = 0;
     do
-    {
+    {   
+        fprintf(stderr, "%s", specs[n].dest_sa);
         fd                 = (int) (uint64_t) specs[n].peer_ctx;
         msg.msg_name       = (void *) specs[n].dest_sa;
         msg.msg_namelen    = (AF_INET == specs[n].dest_sa->sa_family ?
@@ -115,20 +119,6 @@ static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spe
                                             sizeof(struct sockaddr_in6)),
         msg.msg_iov        = specs[n].iov;
         msg.msg_iovlen     = specs[n].iovlen;
-
-        /* Set up ancillary message */
-        // cw = 0;
-        // if (specs[n].ecn)
-        //     cw |= CW_ECN;
-        // if (cw)
-        //     tut_setup_control_msg(&msg, cw, &specs[n], ancil.buf,
-        //                                             sizeof(ancil.buf));
-        // else
-        // {
-            msg.msg_control    = NULL;
-            msg.msg_controllen = 0;
-        // }
-
         s = sendmsg(fd, &msg, 0);
         if (s < 0)
         {
@@ -152,10 +142,11 @@ static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spe
 }
 
 static lsquic_conn_ctx_t *my_client_on_new_conn(void *stream_if_ctx, struct lsquic_conn *conn) {
-    proxy_client_ctx *client_ctc = stream_if_ctx;
-    lsquic_conn_ctx_t *conn_h = calloc(1, sizeof(*conn_h));
+    // proxy_client_ctx *client_ctc = stream_if_ctx;
+    lsquic_conn_ctx_t *conn_h = stream_if_ctx;
     conn_h->conn = conn;
-    conn_h->client_ctx = client_ctc;
+    lsquic_conn_make_stream(conn);
+    conn_h->client_ctx = stream_if_ctx;
     return conn_h;
 }
 
@@ -191,72 +182,116 @@ static lsquic_stream_ctx_t *my_client_on_new_stream (void *stream_if_ctx, struct
     st_h->client_ctx = stream_if_ctx;
     LOG("created new stream, we want to write");
     lsquic_stream_wantwrite(stream, 1);
-    /* return tut: we don't have any stream-specific context */
     return st_h;
 }
 
-static size_t
-my_client_read(void *ctx, const unsigned char *data, size_t len, int fin)
-{
-    if (len)
+static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+    ssize_t nread;
+    unsigned char buf[0x1000];
+
+    nread = lsquic_stream_readf(stream, buf, sizeof(buf));
+    if (nread > 0)
     {
-        fwrite(data, 1, len, stdout);
+        fwrite(buf, 1, nread, stdout);
         fflush(stdout);
     }
-    return len;
+    else if (nread == 0)
+    {
+        LOG("read to end-of-stream: close connection");
+        lsquic_stream_shutdown(stream, 0);
+        lsquic_conn_close( lsquic_stream_conn(stream) );
+    }
+    else {
+        LOG("error reading from stream (%s) -- exit loop");
+        exit((EXIT_FAILURE));
+    }
 }
 
-static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h){
-    struct tut *tut = (struct tut *) h;
-    ssize_t nread;
+struct header_buf
+{
+    unsigned    off;
+    char        buf[UINT16_MAX];
+};
 
-    nread = lsquic_stream_readf(stream, my_client_read, NULL);
-    if (nread == 0)
+
+/* Convenience wrapper around somewhat involved lsxpack APIs */
+int
+client_set_header (struct lsxpack_header *hdr, struct header_buf *header_buf,
+            const char *name, size_t name_len, const char *val, size_t val_len)
+{
+    if (header_buf->off + name_len + val_len <= sizeof(header_buf->buf))
     {
-        LOG("read to end-of-stream: close and read from stdin again");
-        lsquic_stream_shutdown(stream, 0);
+        memcpy(header_buf->buf + header_buf->off, name, name_len);
+        memcpy(header_buf->buf + header_buf->off + name_len, val, val_len);
+        lsxpack_header_set_offset2(hdr, header_buf->buf + header_buf->off,
+                                            0, name_len, name_len, val_len);
+        header_buf->off += name_len + val_len;
+        return 0;
     }
-    else if (nread < 0)
-    {
-        LOG("error reading from stream (%s) -- exit loop");
-    }
+    else
+        return -1;
 }
 
 static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
     lsquic_conn_t *conn;
     proxy_client_ctx *client_ctx;
-    ssize_t nw;
-    conn = lsquic_stream_conn(stream);
-    struct lsquic_conn_ctx *conn_ctx = lsquic_conn_get_ctx(conn);
+    lsquic_stream_ctx_t *st_f = h;
+    struct header_buf hbuf;
+    struct lsxpack_header harray[5];
+    struct lsquic_http_headers headers = { 6, harray, };
 
-    nw = lsquic_stream_write(stream, client_ctx->buf, client_ctx->sz);
+    hbuf.off = 0;
+#define V(v) (v), strlen(v)
+    client_set_header(&harray[0], &hbuf, V(":method"), V("CONNECT"));
+    client_set_header(&harray[1], &hbuf, V(":protocol"), V("connect-udp"));
+    client_set_header(&harray[2], &hbuf, V(":scheme"), V("https"));
+    client_set_header(&harray[3], &hbuf, V(":path"), V("/udp/192.168.122.252/8888"));
+    client_set_header(&harray[4], &hbuf, V(":authority"),
+                                              V("142.250.191.78:443"));
+    client_set_header(&harray[5], &hbuf, V("user-agent"), V("h3cli/lsquic"));
 
-    if (nw > 0)
+    if (0 == lsquic_stream_send_headers(stream, &headers, 0))
     {
-        client_ctx->sz -= (size_t) nw;
-        if (client_ctx->sz == 0)
-        {
-            LOG("wrote all %zd bytes to stream, switch to reading",
-                                                            (size_t) nw);
-            lsquic_stream_shutdown(stream, 1);  /* This flushes as well */
-            lsquic_stream_wantread(stream, 1);
-        }
-        else
-        {
-            memmove(client_ctx->buf, client_ctx->buf + nw, client_ctx->sz);
-            LOG("wrote %zd bytes to stream, still have %zd bytes to write",
-                                                (size_t) nw, client_ctx->sz);
-        }
+        lsquic_stream_shutdown(stream, 1);
+        lsquic_stream_wantread(stream, 1);
     }
     else
     {
-        /* When `on_write()' is called, the library guarantees that at least
-         * something can be written.  If not, that's an error whether 0 or -1
-         * is returned.
-         */
-        LOG("stream_write() returned %ld, abort connection", (long) nw);
+        LOG("ERROR: lsquic_stream_send_headers failed: %s", strerror(errno));
         lsquic_conn_abort(lsquic_stream_conn(stream));
     }
+    // ssize_t nw;
+    // conn = lsquic_stream_conn(stream);
+    // struct lsquic_conn_ctx *conn_ctx = lsquic_conn_get_ctx(conn);
+
+    // nw = lsquic_stream_write(stream, client_ctx->buf, client_ctx->sz);
+
+    // if (nw > 0)
+    // {
+    //     client_ctx->sz -= (size_t) nw;
+    //     if (client_ctx->sz == 0)
+    //     {
+    //         LOG("wrote all %zd bytes to stream, switch to reading",
+    //                                                         (size_t) nw);
+    //         lsquic_stream_shutdown(stream, 1);  /* This flushes as well */
+    //         lsquic_stream_wantread(stream, 1);
+    //     }
+    //     else
+    //     {
+    //         memmove(client_ctx->buf, client_ctx->buf + nw, client_ctx->sz);
+    //         LOG("wrote %zd bytes to stream, still have %zd bytes to write",
+    //                                             (size_t) nw, client_ctx->sz);
+    //     }
+    // }
+    // else
+    // {
+    //     /* When `on_write()' is called, the library guarantees that at least
+    //      * something can be written.  If not, that's an error whether 0 or -1
+    //      * is returned.
+    //      */
+    //     LOG("stream_write() returned %ld, abort connection", (long) nw);
+    //     lsquic_conn_abort(lsquic_stream_conn(stream));
+    // }
 }
 
 static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
@@ -294,10 +329,35 @@ static struct lsquic_stream_if my_client_callbacks =
 struct sockaddr_in proxy_sa;
 struct sockaddr_in target_sa;
 
+static void
+cli_usage () {
+    fprintf(stdout,
+"Usage:./client [options]\n"
+"\n"
+"   -t ip_addr      Set target server's IPv4 address\n"
+"   -p ip_addr      Set proxy server's IPv4 address\n"
+"   -f log_file     Set external file for logs\n"
+"   -l level        Set library-wide log level.  Defaults to 'warning'.\n"
+"                   Acceptable values are debug, info, notice, warning, error, alert, emerg, crit\n"
+"   -v              Verbose: log program messages as well.\n"
+// "   -M METHOD       Method.  GET by default.\n"
+// "   -o opt=val      Set lsquic engine setting to some value, overriding the\n"
+// "                     defaults.  For example,\n"
+// "                           -o version=ff00001c -o cc_algo=2\n"
+// "   -G DIR          Log TLS secrets to a file in directory DIR.\n"
+"   -h              Print this help screen and exit.\n");
+}
+
 void argument_parser(int argc, char** argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "vf:p:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "hlvf:p:t:")) != -1) {
         switch(opt) {
+            case 'l':
+                if (0 != lsquic_set_log_level(optarg)) {
+                    fprintf(stderr, "error processing log-level: %s\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                break;
             case 'v':
                 s_verbose = 1;
                 break;
@@ -324,6 +384,10 @@ void argument_parser(int argc, char** argv) {
                     exit(EXIT_FAILURE);
                 }
                 break;
+            case 'h':
+                cli_usage();
+                exit(EXIT_SUCCESS);
+                break;
             default:
                 fprintf(stderr, "Unknown option %c\n", opt);
                 exit(EXIT_FAILURE);
@@ -343,30 +407,41 @@ static void signal_handler(int signum) {
 int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
     struct lsquic_engine_settings settings;
+    socklen_t socklen;
     proxy_client_ctx client_ctx;
+    memset(&client_ctx, 0, sizeof(client_ctx));
+    client_ctx.method = "GET";
+
     log_file = stderr;
     char errbuf[0x100];
-
-    struct sockaddr_in local_sa;
-    memset(&local_sa, 0, sizeof(local_sa));
-    local_sa.sin_family = AF_INET;
-    local_sa.sin_addr.s_addr = inet_addr("192.168.122.125");
-    local_sa.sin_port = 443;
 
     memset(&target_sa, 0, sizeof(target_sa));
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
     proxy_sa.sin_addr.s_addr = inet_addr("142.250.191.78");  /*www.google.com*/
-    proxy_sa.sin_port = 443;
+    proxy_sa.sin_port = HTTP_PORT;
 
-    if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
-        fprintf(stderr, "Lsquic global initialisation failed");
+    if ((client_ctx.sockfd = socket(proxy_sa.sin_family, SOCK_DGRAM, 0)) < 0) {
+        perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
-    argument_parser(argc, argv);
 
-    setvbuf(log_file, NULL, _IOLBF, 0);
-    lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
+    socklen = sizeof(client_ctx.local_sa);
+    if (0 != bind(client_ctx.sockfd, &client_ctx.local_sa, socklen))
+    {
+        perror("bind");
+        exit(EXIT_FAILURE);
+    }
+
+    getsockname(client_ctx.sockfd, (struct sockaddr *)&client_ctx.local_sa, &socklen);
+    LOG("Socket bound to port %d\n", ntohs(client_ctx.local_sa.sin_port));
+
+    if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
+        fprintf(stderr, "lsquic global initialisation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    argument_parser(argc, argv);
 
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
     settings.es_ql_bits = 0;
@@ -377,38 +452,52 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
+    setvbuf(log_file, NULL, _IOLBF, 0);
+    lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
+    // lsquic_set_log_level("warnung");
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
 
     memset(&engine_api, 0, sizeof(engine_api));
     engine_api.ea_packets_out = client_packets_out;
-    engine_api.ea_packets_out_ctx = NULL;
+    engine_api.ea_packets_out_ctx = &client_ctx;
     engine_api.ea_stream_if = &my_client_callbacks;
-    engine_api.ea_stream_if_ctx = NULL;
+    engine_api.ea_stream_if_ctx = &client_ctx;
     engine_api.ea_settings = &settings;
 
+    LOG("Creating a new engine");
     client_ctx.engine = lsquic_engine_new(LSENG_HTTP, &engine_api);
     if (!client_ctx.engine) {
         LOG("cannot create engine\n");
         exit(EXIT_FAILURE);
     }
 
-    lsquic_conn_t *conn;
-    const char *server_name = "www.google.com"; // Or the server's IP
-    int server_port = 443; // Default for HTTPS
+    
+    struct lsquic_conn_ctx conn_ctx;
+    conn_ctx.client_ctx = client_ctx.engine;
 
     /*lsquic_conn_t *lsquic_engine_connect(lsquic_engine_t *engine, enum lsquic_
         version version, const struct sockaddr *local_sa, const struct sockaddr *peer_sa, 
         void *peer_ctx, lsquic_conn_ctx_t *conn_ctx, const char *sni, unsigned short base_plpmtu, 
         const unsigned char *sess_resume, size_t sess_resume_len, const unsigned char *token, 
         size_t token_sz) */
-
-    conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &local_sa, &proxy_sa, NULL,
-                                    &conn, NULL, NULL, NULL, NULL, NULL, NULL);
+    LOG("Connecting to peer");
+    conn_ctx.conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &client_ctx.local_sa, &proxy_sa, NULL,
+                                    &conn_ctx, NULL, 0, NULL, 0, NULL, 0);
     
-
-    // lsquic_stream_t *stream = lsquic_conn_make_stream(conn);
+    if (!conn_ctx.conn)
+    {
+        LOG("cannot create connection");
+        exit(EXIT_FAILURE);
+    }
+    LOG("engine_process_conns called");
+    lsquic_engine_process_conns(client_ctx.engine);
+    // int ev;
+    // while ((ev = lsquic_engine_process_conns(client_ctx.engine)) >= 0) {
+    //     // This loop processes QUIC events. Your callbacks will be invoked here.
+    // } 
     // lsquic_stream_wantwrite(stream, 1);
     
     // ... send request in your `on_write` callback...
@@ -417,9 +506,11 @@ int main(int argc, char** argv) {
     // while ((ev = lsquic_engine_process_conns(engine)) >= 0) {
     // }
 
-
-    // lsquic_conn_close(conn);
-    lsquic_engine_destroy(client_ctx.engine);
+    if (conn_ctx.conn) {
+        lsquic_conn_going_away(conn_ctx.conn);
+        lsquic_conn_close(conn_ctx.conn);
+    }
+    if (client_ctx.engine) lsquic_engine_destroy(client_ctx.engine);
     // free(&client_ctx);
     lsquic_global_cleanup();
     return 0;
