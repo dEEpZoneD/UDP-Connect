@@ -111,8 +111,7 @@ static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spe
     msg.msg_controllen = 0;
     do
     {   
-        fprintf(stderr, "%s", specs[n].dest_sa);
-        fd                 = (int) (uint64_t) specs[n].peer_ctx;
+        fd                 = (int)packets_out_ctx;
         msg.msg_name       = (void *) specs[n].dest_sa;
         msg.msg_namelen    = (AF_INET == specs[n].dest_sa->sa_family ?
                                             sizeof(struct sockaddr_in) :
@@ -350,8 +349,11 @@ cli_usage () {
 
 void argument_parser(int argc, char** argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "hlvf:p:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "hl:vf:p:t:m:")) != -1) {
         switch(opt) {
+            case 'm':
+                printf("%s\n", optarg);
+                break;
             case 'l':
                 if (0 != lsquic_set_log_level(optarg)) {
                     fprintf(stderr, "error processing log-level: %s\n", optarg);
@@ -415,6 +417,11 @@ int main(int argc, char** argv) {
     log_file = stderr;
     char errbuf[0x100];
 
+    struct sockaddr_in local_sa;
+    memset(&local_sa, 0, sizeof(local_sa));
+    local_sa.sin_family = AF_INET;
+    local_sa.sin_addr.s_addr = inet_addr("142.250.191.78");
+    local_sa.sin_port = HTTP_PORT;
     memset(&target_sa, 0, sizeof(target_sa));
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
@@ -427,13 +434,15 @@ int main(int argc, char** argv) {
     }
 
     socklen = sizeof(client_ctx.local_sa);
-    if (0 != bind(client_ctx.sockfd, &client_ctx.local_sa, socklen))
+    if (0 != bind(client_ctx.sockfd, (struct sockaddr *)&client_ctx.local_sa, socklen))
     {
         perror("bind");
         exit(EXIT_FAILURE);
     }
 
-    getsockname(client_ctx.sockfd, (struct sockaddr *)&client_ctx.local_sa, &socklen);
+    client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.125");
+
+    getsockname(client_ctx.sockfd, &client_ctx.local_sa, &socklen);
     LOG("Socket bound to port %d\n", ntohs(client_ctx.local_sa.sin_port));
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
@@ -466,9 +475,12 @@ int main(int argc, char** argv) {
     engine_api.ea_stream_if = &my_client_callbacks;
     engine_api.ea_stream_if_ctx = &client_ctx;
     engine_api.ea_settings = &settings;
+    // engine_api.ea_hsi_if = 1;
 
     LOG("Creating a new engine");
-    client_ctx.engine = lsquic_engine_new(LSENG_HTTP, &engine_api);
+    lsquic_engine_t *engine;
+    engine = lsquic_engine_new(LSENG_HTTP, &engine_api);
+    client_ctx.engine = engine;
     if (!client_ctx.engine) {
         LOG("cannot create engine\n");
         exit(EXIT_FAILURE);
@@ -476,7 +488,7 @@ int main(int argc, char** argv) {
 
     
     struct lsquic_conn_ctx conn_ctx;
-    conn_ctx.client_ctx = client_ctx.engine;
+    conn_ctx.client_ctx = &client_ctx;
 
     /*lsquic_conn_t *lsquic_engine_connect(lsquic_engine_t *engine, enum lsquic_
         version version, const struct sockaddr *local_sa, const struct sockaddr *peer_sa, 
@@ -484,7 +496,7 @@ int main(int argc, char** argv) {
         const unsigned char *sess_resume, size_t sess_resume_len, const unsigned char *token, 
         size_t token_sz) */
     LOG("Connecting to peer");
-    conn_ctx.conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &client_ctx.local_sa, &proxy_sa, NULL,
+    conn_ctx.conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &local_sa, &proxy_sa, NULL,
                                     &conn_ctx, NULL, 0, NULL, 0, NULL, 0);
     
     if (!conn_ctx.conn)
@@ -493,7 +505,7 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
     LOG("engine_process_conns called");
-    lsquic_engine_process_conns(client_ctx.engine);
+    lsquic_engine_process_conns(engine);
     // int ev;
     // while ((ev = lsquic_engine_process_conns(client_ctx.engine)) >= 0) {
     //     // This loop processes QUIC events. Your callbacks will be invoked here.
@@ -510,7 +522,7 @@ int main(int argc, char** argv) {
         lsquic_conn_going_away(conn_ctx.conn);
         lsquic_conn_close(conn_ctx.conn);
     }
-    if (client_ctx.engine) lsquic_engine_destroy(client_ctx.engine);
+    if (engine) lsquic_engine_destroy(client_ctx.engine);
     // free(&client_ctx);
     lsquic_global_cleanup();
     return 0;

@@ -18,7 +18,7 @@
 #include <openssl/err.h>
 
 #include "lsquic.h"
-#include "../src/liblsquic/lsquic_hash.h"
+// #include "../src/liblsquic/lsquic_hash.h"
 #include "../src/liblsquic/lsquic_logger.h"
 #include "../src/liblsquic/lsquic_int_types.h"
 #include "../src/liblsquic/lsquic_util.h"
@@ -30,6 +30,8 @@
 
 #define PORT 4443
 #define BUF_SIZE 1024
+
+static ssize_t s_pwritev;
 
 static FILE *log_file;
 
@@ -78,6 +80,48 @@ struct lsquic_conn_ctx
     }                    flags;
 };
 
+struct lsquic_stream_ctx {
+    lsquic_stream_t     *stream;
+    struct server_ctx   *server_ctx;
+    FILE                *req_fh;
+    char                *req_buf;
+    char                *req_filename;
+    char                *req_path;
+    size_t               req_sz;
+    enum {
+        SH_HEADERS_SENT = (1 << 0),
+        SH_DELAYED      = (1 << 1),
+        SH_HEADERS_READ = (1 << 2),
+    }                    flags;
+    struct lsquic_reader reader;
+    int                  file_fd;   /* Used by pwritev */
+
+    /* Fields below are used by interop callbacks: */
+    enum interop_handler {
+        IOH_ERROR,
+        IOH_INDEX_HTML,
+        IOH_MD5SUM,
+        IOH_VER_HEAD,
+        IOH_GEN_FILE,
+        IOH_ECHO,
+    }                    interop_handler;
+    struct req          *req;
+    const char          *resp_status;
+    // union {
+    //     struct index_html_ctx   ihc;
+    //     struct ver_head_ctx     vhc;
+    //     struct md5sum_ctx       md5c;
+    //     struct gen_file_ctx     gfc;
+    //     struct {
+    //         char buf[0x100];
+    //         struct resp resp;
+    //     }                       err;
+    // }                    interop_u;
+    struct event        *resume_resp;
+    size_t               written;
+    size_t               file_size; /* Used by pwritev */
+};
+
 // static int server_packets_out();
 // static int server_packets_in();
 
@@ -94,7 +138,6 @@ static lsquic_conn_ctx_t *server_on_new_conn(void *stream_if_ctx, struct lsquic_
     server_ctx->conn_h = conn_h;
     ++server_ctx->n_current_conns;
     return conn_h;
-
 }
 
 static void
@@ -112,26 +155,17 @@ static void server_on_conn_closed (struct lsquic_conn *conn) {
     lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
     LSQ_INFO("Connection closed");
     --conn_h->server_ctx->n_current_conns;
-    if ((conn_h->server_ctx->prog->prog_flags & PROG_FLAG_COOLDOWN)
-                                && 0 == conn_h->server_ctx->n_current_conns)
-    {
-        if (!stopped)
-        {
-            stopped = 1;
-            prog_stop(conn_h->server_ctx->prog);
-        }
-    }
     if (conn_h->server_ctx->max_conn > 0)
     {
         ++conn_h->server_ctx->n_conn;
-        LSQ_NOTICE("Connection closed, remaining: %d",
+        LOG("Connection closed, remaining: %d",
                    conn_h->server_ctx->max_conn - conn_h->server_ctx->n_conn);
         if (conn_h->server_ctx->n_conn >= conn_h->server_ctx->max_conn)
         {
             if (!stopped)
             {
                 stopped = 1;
-                prog_stop(conn_h->server_ctx->prog);
+                exit(EXIT_FAILURE);
             }
         }
     }
@@ -139,17 +173,101 @@ static void server_on_conn_closed (struct lsquic_conn *conn) {
     lsquic_conn_set_ctx(conn, NULL);
     free(conn_h);
 }
-static lsquic_stream_ctx_t *server_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream);
-static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
-static void server_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
-    lsquic_conn_t *conn;
-    server_ctx *server_ctx;
-    ssize_t nw;
-    conn = lsquic_stream_conn(stream);
-    server_ctx = (void *) lsquic_conn_get_ctx(conn);
-
-    nw = lsquic_stream_write(stream, tut->tut_u.c.buf, tut->tut_u.c.sz);
+static lsquic_stream_ctx_t *server_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream) {
+    struct lsquic_stream_ctx *st_h = calloc(1, sizeof(*st_h));
+    st_h->stream = stream;
+    st_h->server_ctx = stream_if_ctx;
+    lsquic_stream_wantread(stream, 1);
+    return st_h;
 }
+
+static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
+
+static void server_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+    if (st_h->flags & SH_HEADERS_SENT)
+    {
+        ssize_t nw;
+        if (bytes_left(st_h) > 0)
+        {
+            // if (st_h->server_ctx->delay_resp_sec
+            //         && !(st_h->flags & SH_DELAYED)
+            //             && st_h->written > 10000000)
+            // {
+            //     struct timeval delay = {
+            //                     .tv_sec = st_h->server_ctx->delay_resp_sec, };
+            //     st_h->resume_resp = event_new(st_h->server_ctx->prog->prog_eb,
+            //                 -1, EV_TIMEOUT, resume_response, st_h);
+            //     if (st_h->resume_resp)
+            //     {
+            //         event_add(st_h->resume_resp, &delay);
+            //         lsquic_stream_wantwrite(stream, 0);
+            //         st_h->flags |= SH_DELAYED;
+            //         LSQ_NOTICE("delay response of stream %"PRIu64" for %u seconds",
+            //             lsquic_stream_id(stream), st_h->server_ctx->delay_resp_sec);
+            //         return;
+            //     }
+            //     else
+            //         LSQ_ERROR("cannot allocate event");
+            // }
+            if (s_pwritev)
+            {
+                size_t to_write = bytes_left(st_h);
+                if (s_pwritev > 0 && (size_t) s_pwritev < to_write)
+                    to_write = s_pwritev;
+                nw = lsquic_stream_pwritev(stream, my_preadv, st_h, to_write);
+                if (nw == 0)
+                {
+                    struct lsquic_reader reader = {
+                        .lsqr_read = pwritev_fallback_read,
+                        .lsqr_size = pwritev_fallback_size,
+                        .lsqr_ctx = st_h,
+                    };
+                    nw = lsquic_stream_writef(stream, &reader);
+                }
+            }
+            else
+            {
+                nw = lsquic_stream_writef(stream, &st_h->reader);
+            }
+            if (nw < 0)
+            {
+                struct lsquic_conn *conn = lsquic_stream_conn(stream);
+                lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
+                if (conn_h->flags & RECEIVED_GOAWAY)
+                {
+                    LSQ_NOTICE("cannot write: goaway received");
+                    lsquic_stream_close(stream);
+                }
+                else
+                {
+                    LSQ_ERROR("write error: %s", strerror(errno));
+                    exit(1);
+                }
+            }
+            if (bytes_left(st_h) > 0)
+            {
+                st_h->written += (size_t) nw;
+                lsquic_stream_wantwrite(stream, 1);
+            }
+            else
+            {
+                lsquic_stream_shutdown(stream, 1);
+                lsquic_stream_wantread(stream, 1);
+            }
+        }
+        else
+        {
+            lsquic_stream_shutdown(stream, 1);
+            lsquic_stream_wantread(stream, 1);
+        }
+    }
+    else
+    {
+        if (0 != send_headers(stream, st_h))
+            exit(1);
+    }
+}
+
 static void server_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
     LOG("stream closed");
 }
