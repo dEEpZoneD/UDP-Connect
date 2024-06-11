@@ -5,6 +5,8 @@
 #include <signal.h>
 #include <assert.h>
 #include <errno.h>
+#include <event2/event.h>
+#include <event2/util.h>
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -32,7 +34,7 @@ struct lsquic_http_headers headers;
 typedef struct
 {
     lsquic_engine_t *engine;
-    char payload_sizep[20];
+    // char payload_sizep[20];
     int sockfd;
     struct sockaddr_in local_sa;
     struct sockaddr_storage local_sas;
@@ -89,29 +91,57 @@ LOG (const char *fmt, ...)
     {
         va_list ap;
         fprintf(log_file, "LOG: ");
-        va_start( ap, fmt);
+        va_start(ap, fmt);
         (void) vfprintf(log_file, fmt, ap);
         va_end(ap);
         fprintf(log_file, "\n");
     }
 }
 
+int read_socket(evutil_socket_t fd, short events, void *arg) {
+    proxy_client_ctx *const client_ctx;
+    ssize_t nread;
+    struct sockaddr_storage peer_sas, local_sas;
+    unsigned char buf[0x1000];
+    struct msghdr msg = {
+        .msg_name       = &peer_sas,
+        .msg_namelen    = sizeof(peer_sas),
+        // .msg_iov        = specs[n].iov,
+        // .msg_iovlen     = specs[n].iovlen,
+    };
+    nread = recvmsg(fd, &msg, 0);
+    if (-1 == nread) {
+        if (!(EAGAIN == errno || EWOULDBLOCK == errno))
+            LOG("recvmsg: %s", strerror(errno));
+        return;
+    }
+    // local_sas = client_ctx->local_sas;
+
+    (void) lsquic_engine_packet_in(client_ctx->engine, buf, nread,
+        (struct sockaddr *) &local_sas,
+        (struct sockaddr *) &peer_sas, 0, 0);
+
+    lsquic_engine_process_conns(client_ctx->engine);
+}
+
 static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spec *specs, unsigned count) {
-    proxy_client_ctx const* client_ctx = packets_out_ctx;
+    proxy_client_ctx *client_ctx = packets_out_ctx;
     unsigned n;
     int fd, s = 0;
     struct msghdr msg;
 
-    if (0 == count)
+    if (0 == count) 
         return 0;
 
+    fd = 3;
     n = 0;
+    LOG("sockfd = %d", fd);
     msg.msg_flags      = 0;
     msg.msg_control    = NULL;
     msg.msg_controllen = 0;
     do
     {   
-        fd                 = (int)packets_out_ctx;
+        // fd                 = (int) (uint64_t) specs[n].peer_ctx;
         msg.msg_name       = (void *) specs[n].dest_sa;
         msg.msg_namelen    = (AF_INET == specs[n].dest_sa->sa_family ?
                                             sizeof(struct sockaddr_in) :
@@ -163,7 +193,7 @@ static void my_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status s
 static void my_client_on_conn_closed (struct lsquic_conn *conn) {
     lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
     lsquic_conn_set_ctx(conn, NULL);
-    free(conn_h);
+    // free(conn_h);
     LOG("Connection closed");
 }
 
@@ -410,18 +440,18 @@ int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
     struct lsquic_engine_settings settings;
     socklen_t socklen;
+    int sockfd;
     proxy_client_ctx client_ctx;
     memset(&client_ctx, 0, sizeof(client_ctx));
-    client_ctx.method = "GET";
 
     log_file = stderr;
     char errbuf[0x100];
 
     struct sockaddr_in local_sa;
     memset(&local_sa, 0, sizeof(local_sa));
-    local_sa.sin_family = AF_INET;
-    local_sa.sin_addr.s_addr = inet_addr("142.250.191.78");
-    local_sa.sin_port = HTTP_PORT;
+    // local_sa.sin_family = AF_INET;
+    // local_sa.sin_addr.s_addr = inet_addr("142.250.191.78");
+    // local_sa.sin_port = HTTP_PORT;
     memset(&target_sa, 0, sizeof(target_sa));
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
@@ -432,6 +462,7 @@ int main(int argc, char** argv) {
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
+    // client_ctx.sockfd = sockfd;
 
     socklen = sizeof(client_ctx.local_sa);
     if (0 != bind(client_ctx.sockfd, (struct sockaddr *)&client_ctx.local_sa, socklen))
@@ -440,10 +471,10 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
-    client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.125");
+    // client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.125");
 
-    getsockname(client_ctx.sockfd, &client_ctx.local_sa, &socklen);
-    LOG("Socket bound to port %d\n", ntohs(client_ctx.local_sa.sin_port));
+    getsockname(client_ctx.sockfd, &(client_ctx.local_sa), &socklen);
+    fprintf(stderr, "Socket bound to port %d and fd: %d\n", ntohs(client_ctx.local_sa.sin_port), client_ctx.sockfd);
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
         fprintf(stderr, "lsquic global initialisation failed");
@@ -453,7 +484,7 @@ int main(int argc, char** argv) {
     argument_parser(argc, argv);
 
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
-    settings.es_ql_bits = 0;
+    // settings.es_ql_bits = 0;
 
     if (0 != lsquic_engine_check_settings(&settings, LSENG_HTTP,
     errbuf, sizeof(errbuf))) {
@@ -496,34 +527,43 @@ int main(int argc, char** argv) {
         const unsigned char *sess_resume, size_t sess_resume_len, const unsigned char *token, 
         size_t token_sz) */
     LOG("Connecting to peer");
-    conn_ctx.conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &local_sa, &proxy_sa, NULL,
+    lsquic_conn_t *conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &(client_ctx.local_sa), &proxy_sa, NULL,
                                     &conn_ctx, NULL, 0, NULL, 0, NULL, 0);
     
+    conn_ctx.conn = conn;
     if (!conn_ctx.conn)
     {
         LOG("cannot create connection");
         exit(EXIT_FAILURE);
     }
-    LOG("engine_process_conns called");
-    lsquic_engine_process_conns(engine);
-    // int ev;
-    // while ((ev = lsquic_engine_process_conns(client_ctx.engine)) >= 0) {
-    //     // This loop processes QUIC events. Your callbacks will be invoked here.
-    // } 
-    // lsquic_stream_wantwrite(stream, 1);
-    
-    // ... send request in your `on_write` callback...
+    // struct event_base *base = event_base_new(); // Create the event base
 
-    // int ev;
-    // while ((ev = lsquic_engine_process_conns(engine)) >= 0) {
+    // if (!base) {
+    //     fprintf(stderr, "Couldn't create event_base\n");
+    //     return 1;
     // }
 
+    // struct event *evtimer = event_new(base, -1, EV_PERSIST, timer_callback, NULL);
+    // struct timeval tv = {5, 0}; // 5 seconds
+    // event_add(evtimer, &tv);
+
+    // struct event *evsocket = event_new(base, client_ctx.sockfd, EV_WRITE | EV_READ | EV_PERSIST, read_socket, NULL);
+    // event_add(evsocket, NULL);
+    LOG("engine_process_conns called");
+    while(1) lsquic_engine_process_conns(engine);
+    
     if (conn_ctx.conn) {
+        LOG("Closing connection");
         lsquic_conn_going_away(conn_ctx.conn);
         lsquic_conn_close(conn_ctx.conn);
     }
-    if (engine) lsquic_engine_destroy(client_ctx.engine);
+
+    if (engine) {
+        LOG("Destroying engine");
+        lsquic_engine_destroy(engine);
+    }
     // free(&client_ctx);
+    LOG("Did everything, exiting...");
     lsquic_global_cleanup();
     return 0;
 }

@@ -28,6 +28,8 @@
 // #include "test_cert.h"
 // #include "prog.h"
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 #define PORT 4443
 #define BUF_SIZE 1024
 
@@ -36,14 +38,14 @@ static ssize_t s_pwritev;
 static FILE *log_file;
 
 static int
-tut_log_buf (void *ctx, const char *buf, size_t len)
+my_log_buf (void *ctx, const char *buf, size_t len)
 {
     FILE *out = ctx;
     fwrite(buf, 1, len, out);
     fflush(out);
     return 0;
 }
-static const struct lsquic_logger_if logger_if = { tut_log_buf, };
+static const struct lsquic_logger_if logger_if = { my_log_buf, };
 
 static int s_verbose;
 static void
@@ -64,11 +66,16 @@ struct server_ctx
 {
     struct lsquic_conn_ctx  *conn_h;
     lsquic_engine_t *engine;
-    struct prog *prog;
+    int sockfd;
     unsigned max_conn;
     unsigned n_conn;
     unsigned n_current_conns;
-    unsigned delay_resp_sec;    
+    unsigned delay_resp_sec;
+    char *method;
+    char *protocol;
+    char *scheme;
+    char * path;
+    char *authority;
 };
 
 struct lsquic_conn_ctx
@@ -77,17 +84,49 @@ struct lsquic_conn_ctx
     struct server_ctx *server_ctx;
     enum {
         RECEIVED_GOAWAY = 1 << 0,
+        HANDSHK_DONE = 1 << 1,
     }                    flags;
+};
+
+struct resp
+{
+    unsigned char *buf;
+    size_t sz;
+    off_t off;
+};
+
+struct req
+{
+    // enum method {
+    //     UNSET, GET, POST, UNSUPPORTED,
+    // }            method;
+    enum {
+        HAVE_XHDR   = 1 << 0,
+    }            flags;
+    enum {
+        PH_AUTHORITY    = 1 << 0,
+        PH_METHOD       = 1 << 1,
+        PH_PATH         = 1 << 2,
+    }            pseudo_headers;
+    char        *path;
+    char        *method;
+    char        *authority;
+    char        *scheme;
+    char        *protocol;
+    // char        *qif;
+    // size_t       qif;
+    struct lsxpack_header
+                 xhdr;
+    size_t       decode_off;
+    char         decode_buf[MIN(LSXPACK_MAX_STRLEN + 1, 64 * 1024)];
 };
 
 struct lsquic_stream_ctx {
     lsquic_stream_t     *stream;
     struct server_ctx   *server_ctx;
-    FILE                *req_fh;
-    char                *req_buf;
-    char                *req_filename;
-    char                *req_path;
-    size_t               req_sz;
+    unsigned char *buf;
+    size_t sz;
+    off_t off;
     enum {
         SH_HEADERS_SENT = (1 << 0),
         SH_DELAYED      = (1 << 1),
@@ -96,15 +135,7 @@ struct lsquic_stream_ctx {
     struct lsquic_reader reader;
     int                  file_fd;   /* Used by pwritev */
 
-    /* Fields below are used by interop callbacks: */
-    enum interop_handler {
-        IOH_ERROR,
-        IOH_INDEX_HTML,
-        IOH_MD5SUM,
-        IOH_VER_HEAD,
-        IOH_GEN_FILE,
-        IOH_ECHO,
-    }                    interop_handler;
+    
     struct req          *req;
     const char          *resp_status;
     // union {
@@ -112,25 +143,46 @@ struct lsquic_stream_ctx {
     //     struct ver_head_ctx     vhc;
     //     struct md5sum_ctx       md5c;
     //     struct gen_file_ctx     gfc;
-    //     struct {
-    //         char buf[0x100];
-    //         struct resp resp;
-    //     }                       err;
+        struct {
+            char buf[0x100];
+            struct resp resp;
+        }                       err;
     // }                    interop_u;
     struct event        *resume_resp;
     size_t               written;
     size_t               file_size; /* Used by pwritev */
 };
 
-// static int server_packets_out();
-// static int server_packets_in();
+int send_udp_data(struct sockaddr_in *target_addr, const char *data_buf, size_t buf_len) {
+    int sockfd;
+
+    // Create a UDP socket
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket creation failed");
+        return -1;
+    }
+    // Send the data to the target
+    ssize_t sent_len = sendto(sockfd, data_buf, buf_len, 0, (const struct sockaddr *)&target_addr, sizeof(target_addr));
+    if (sent_len < 0) {
+        perror("sendto failed");
+        close(sockfd);
+        return -1;
+    }
+
+    LOG("Sent %zd bytes", sent_len);
+
+    // Close the socket
+    close(sockfd);
+    return 0;
+}
 
 static lsquic_conn_ctx_t *server_on_new_conn(void *stream_if_ctx, struct lsquic_conn *conn) {
     struct server_ctx *server_ctx = stream_if_ctx;
-    const char *sni;
+    // const char *sni;
 
-    sni = lsquic_conn_get_sni(conn);
-    LSQ_DEBUG("new connection, SNI: %s", sni ? sni : "<not set>");
+    // sni = lsquic_conn_get_sni(conn);
+    // LOG("new connection, SNI: %s", sni ? sni : "<not set>");
 
     lsquic_conn_ctx_t *conn_h = malloc(sizeof(*conn_h));
     conn_h->conn = conn;
@@ -173,98 +225,167 @@ static void server_on_conn_closed (struct lsquic_conn *conn) {
     lsquic_conn_set_ctx(conn, NULL);
     free(conn_h);
 }
+
 static lsquic_stream_ctx_t *server_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream) {
-    struct lsquic_stream_ctx *st_h = calloc(1, sizeof(*st_h));
+    struct lsquic_stream_ctx *st_h = malloc(sizeof(*st_h));
+    if (!st_h)
+    {
+        LOG("cannot allocate server stream context");
+        lsquic_conn_abort(lsquic_stream_conn(stream));
+        return NULL;
+    }
     st_h->stream = stream;
     st_h->server_ctx = stream_if_ctx;
     lsquic_stream_wantread(stream, 1);
     return st_h;
 }
 
-static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h);
+static int parse_request(struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
+    int found_method = 0, found_protocol = 0, found_scheme = 0, found_path = 0, found_authority = 0;
+    char *line, *key, *value;
+    line = strtok(st_h->buf, "\r\n");
+    while (line != NULL) {
+        // Split the header line into key and value
+        key = strtok(line, ": ");
+        value = strtok(NULL, "\r\n");
 
-static void server_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
-    if (st_h->flags & SH_HEADERS_SENT)
+        if (key && value) {
+            // Check for required headers
+            if (strcasecmp(key, ":method") == 0 && !found_method) {
+                strncpy(st_h->req->method, value, sizeof(st_h->req->method) - 1);
+                found_method = 1;
+            } else if (strcasecmp(key, ":protocol") == 0 && !found_protocol) {
+                strncpy(st_h->req->protocol, value, sizeof(st_h->req->protocol) - 1);
+                found_protocol = 1;
+            } else if (strcasecmp(key, ":scheme") == 0 && !found_scheme) {
+                strncpy(st_h->req->scheme, value, sizeof(st_h->req->scheme) - 1);
+                found_scheme = 1;
+            } else if (strcasecmp(key, ":path") == 0 && !found_path) {
+                strncpy(st_h->req->path, value, sizeof(st_h->req->path) - 1);
+                found_path = 1;
+            } else if (strcasecmp(key, ":authority") == 0 && !found_authority) {
+                strncpy(st_h->req->authority, value, sizeof(st_h->req->authority) - 1);
+                found_authority = 1;
+            }
+            // Add parsing logic for other headers as needed
+        }
+
+        line = strtok(NULL, "\r\n"); // Get the next line
+    }
+
+    if (found_method && found_protocol && found_scheme && found_path && found_authority) {
+        // All required headers found
+        return 0; // Success
+    }
+
+    
+    // Reached end of headers without finding all required headers, or error occurred
+    return -1; // Error
+}
+
+static int process_request(struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
+    if (st_h->req->protocol == "connect-udp") {
+        send_udp_data()
+    }
+}
+
+static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+    struct lsquic_stream_ctx *st_h = h;
+    ssize_t nread;
+    unsigned char buf[1024];
+
+    nread = lsquic_stream_read(stream, buf, sizeof(buf));
+    if (nread > 0) {
+        st_h->buf = &buf[0];
+        st_h->sz++;
+    }
+    else if (nread == 0) {
+        LOG("got request: `%.*s'", (int) st_h->sz, st_h->buf);
+        // parse_request(stream, st_h);
+        // process_request(stream, st_h);
+        // free(st_h->buf);
+        lsquic_stream_shutdown(stream, 0);
+    }
+    else {
+        LOG("error reading: %s", strerror(errno));
+        lsquic_stream_close(stream);
+    }
+}
+
+struct header_buf
+{
+    unsigned    off;
+    char        buf[UINT16_MAX];
+};
+
+int
+header_set_ptr (struct lsxpack_header *hdr, struct header_buf *header_buf,
+                const char *name, size_t name_len,
+                const char *val, size_t val_len)
+{
+    if (header_buf->off + name_len + val_len <= sizeof(header_buf->buf))
     {
-        ssize_t nw;
-        if (bytes_left(st_h) > 0)
-        {
-            // if (st_h->server_ctx->delay_resp_sec
-            //         && !(st_h->flags & SH_DELAYED)
-            //             && st_h->written > 10000000)
-            // {
-            //     struct timeval delay = {
-            //                     .tv_sec = st_h->server_ctx->delay_resp_sec, };
-            //     st_h->resume_resp = event_new(st_h->server_ctx->prog->prog_eb,
-            //                 -1, EV_TIMEOUT, resume_response, st_h);
-            //     if (st_h->resume_resp)
-            //     {
-            //         event_add(st_h->resume_resp, &delay);
-            //         lsquic_stream_wantwrite(stream, 0);
-            //         st_h->flags |= SH_DELAYED;
-            //         LSQ_NOTICE("delay response of stream %"PRIu64" for %u seconds",
-            //             lsquic_stream_id(stream), st_h->server_ctx->delay_resp_sec);
-            //         return;
-            //     }
-            //     else
-            //         LSQ_ERROR("cannot allocate event");
-            // }
-            if (s_pwritev)
-            {
-                size_t to_write = bytes_left(st_h);
-                if (s_pwritev > 0 && (size_t) s_pwritev < to_write)
-                    to_write = s_pwritev;
-                nw = lsquic_stream_pwritev(stream, my_preadv, st_h, to_write);
-                if (nw == 0)
-                {
-                    struct lsquic_reader reader = {
-                        .lsqr_read = pwritev_fallback_read,
-                        .lsqr_size = pwritev_fallback_size,
-                        .lsqr_ctx = st_h,
-                    };
-                    nw = lsquic_stream_writef(stream, &reader);
-                }
-            }
-            else
-            {
-                nw = lsquic_stream_writef(stream, &st_h->reader);
-            }
-            if (nw < 0)
-            {
-                struct lsquic_conn *conn = lsquic_stream_conn(stream);
-                lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
-                if (conn_h->flags & RECEIVED_GOAWAY)
-                {
-                    LSQ_NOTICE("cannot write: goaway received");
-                    lsquic_stream_close(stream);
-                }
-                else
-                {
-                    LSQ_ERROR("write error: %s", strerror(errno));
-                    exit(1);
-                }
-            }
-            if (bytes_left(st_h) > 0)
-            {
-                st_h->written += (size_t) nw;
-                lsquic_stream_wantwrite(stream, 1);
-            }
-            else
-            {
-                lsquic_stream_shutdown(stream, 1);
-                lsquic_stream_wantread(stream, 1);
-            }
-        }
-        else
-        {
-            lsquic_stream_shutdown(stream, 1);
-            lsquic_stream_wantread(stream, 1);
-        }
+        memcpy(header_buf->buf + header_buf->off, name, name_len);
+        memcpy(header_buf->buf + header_buf->off + name_len, val, val_len);
+        lsxpack_header_set_offset2(hdr, header_buf->buf + header_buf->off,
+                                            0, name_len, name_len, val_len);
+        header_buf->off += name_len + val_len;
+        return 0;
     }
     else
+        return -1;
+}        
+
+static int
+send_headers (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h)
+{
+    struct header_buf hbuf;
+
+    struct lsxpack_header headers_arr[1];
+
+    hbuf.off = 0;
+    header_set_ptr(&headers_arr[0], &hbuf, ":status", 7, "200", 3);
+    lsquic_http_headers_t headers = {
+        .count = sizeof(headers_arr) / sizeof(headers_arr[0]),
+        .headers = headers_arr,
+    };
+    if (0 != lsquic_stream_send_headers(stream, &headers, 0))
     {
-        if (0 != send_headers(stream, st_h))
-            exit(1);
+        LOG("cannot send headers: %s", strerror(errno));
+        return -1;
+    }
+
+    st_h->flags |= SH_HEADERS_SENT;
+    return 0;
+}
+
+static void server_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+    struct lsquic_stream_ctx *st_h = h;
+
+    if (st_h->flags && SH_HEADERS_SENT) {
+        if (0 != send_headers(stream, st_h)) exit(EXIT_FAILURE);
+        return;
+    }
+
+    // const size_t left = tssc->tssc_sz;
+    ssize_t nw;
+    assert(st_h->sz > 0);
+    nw = lsquic_stream_write(stream, st_h->buf+st_h->off, st_h->sz-st_h->off);
+    if (nw > 0) {
+        st_h->off += nw;
+        if (st_h->off == st_h->sz)
+        {
+            LOG("wrote all %zd bytes to stream, close stream",
+                                                            (size_t) nw);
+            lsquic_stream_close(stream);
+        }
+        else
+            LOG("wrote %zd bytes to stream, still have %zd bytes to write",
+                                (size_t) nw, st_h->sz - st_h->off);
+    }
+    else {
+        LOG("stream_write() returned %ld, abort connection", (long) nw);
+        lsquic_conn_abort(lsquic_stream_conn(stream));
     }
 }
 
@@ -272,10 +393,10 @@ static void server_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *
     LOG("stream closed");
 }
 
-static struct lsquic_stream_if my_client_callbacks =
+static struct lsquic_stream_if my_server_callbacks =
 {
     .on_new_conn        = server_on_new_conn,
-    .on_hsk_done        = server_on_hsk_done,
+    // .on_hsk_done        = server_on_hsk_done,
     .on_conn_closed     = server_on_conn_closed,
     .on_new_stream      = server_on_new_stream,
     .on_read            = server_on_read,
@@ -311,12 +432,30 @@ static void signal_handler(int signum) {
 
 void argument_parser(int argc, char** argv) {
     int opt;
-    const char* optstring = "p:t:";
+    const char* optstring = "vp:l:";
     while (opt = getopt(argc, argv, optstring)) {
         switch(opt) {
             case 'p':
                 break;
+            case 'l':
+                if (0 != lsquic_set_log_level(optarg)) {
+                    fprintf(stderr, "error processing log-level: %s\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            case 'v':
+                s_verbose = 1;
+                break;
+            case 'f':
+                log_file = fopen(optarg, "ab");
+                if (!log_file)
+                {
+                    perror("cannot open log file for writing");
+                    exit(EXIT_FAILURE);
+                }
+                break;
             default:
+                exit(EXIT_FAILURE);
                 break;
         }
     }
@@ -324,15 +463,16 @@ void argument_parser(int argc, char** argv) {
 
 /* Return number of packets sent or -1 on error */
 static int
-send_packets_out (void *ctx, const struct lsquic_out_spec *specs,
+send_packets_out (void *packets_out_ctx, const struct lsquic_out_spec *specs,
                                                 unsigned n_specs)
 {
+    struct server_ctx *server_ctx = packets_out_ctx;
     struct msghdr msg;
     int sockfd;
     unsigned n;
 
     memset(&msg, 0, sizeof(msg));
-    sockfd = (int) (uintptr_t) ctx;
+    sockfd = (int) server_ctx->sockfd;
 
     for (n = 0; n < n_specs; ++n)
     {
@@ -349,38 +489,51 @@ send_packets_out (void *ctx, const struct lsquic_out_spec *specs,
 
 int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
-    
+    struct lsquic_engine_settings settings;
+    struct server_ctx server_ctx;
     struct sockaddr* local_addr;
 
-    if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER|LSQUIC_GLOBAL_CLIENT)) {
+    log_file = stderr;
+    char errbuf[0x100];
+
+    if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER)) {
         exit(EXIT_FAILURE);
     }
 
+    memset(&server_ctx, 0, sizeof(server_ctx));
     memset(&engine_api, 0, sizeof(engine_api));
     // int flags;
 
-    // flags = fcntl(fd, F_GETFL);
-    // if (-1 == flags)
-    //     return -1;
-    // flags |= O_NONBLOCK;
-    // if (0 != fcntl(fd, F_SETFL, flags))
-    //     return -1;
-    
-    // memset(local_addr, 0, sizeof(*local_addr));
-    // int on = 1;
-    // local_addr.sa.sa_family = AF_INET;
-    // setsockopt(fd, IPPROTO_IPV6, IPV6_RECVTCLASS, &on, sizeof(on));
-    // local_addr->sa_data = INADDR_ANY;
-    // local_addr.sin_port = htons(PORT);
+    argument_parser(argc, argv);
+
+    lsquic_engine_init_settings(&settings, LSENG_HTTP);
+    settings.es_ql_bits = 0;
+
+    if (0 != lsquic_engine_check_settings(&settings, LSENG_HTTP,
+    errbuf, sizeof(errbuf))) {
+        LOG("invalid settings: %s", errbuf);
+        exit(EXIT_FAILURE);
+    }
+
+    setvbuf(log_file, NULL, _IOLBF, 0);
+    lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    memset(&engine_api, 0, sizeof(engine_api));
+    engine_api.ea_packets_out = send_packets_out;
+    engine_api.ea_packets_out_ctx = &server_ctx;
+    engine_api.ea_stream_if = &my_server_callbacks;
+    engine_api.ea_stream_if_ctx = &server_ctx;
+    engine_api.ea_settings = &settings;
 
     lsquic_engine_t *engine = lsquic_engine_new(LSENG_SERVER|LSENG_HTTP, &engine_api);
     if (!engine) {
         fprintf(stderr, "cannot create engine\n");
         exit(EXIT_FAILURE);
     }
+    server_ctx.engine = engine;
 
     int lsquic_engine_packet_in (lsquic_engine_t *,
         const unsigned char *udp_payload, size_t sz,
@@ -388,7 +541,7 @@ int main(int argc, char** argv) {
         const struct sockaddr *sa_peer,
         void *peer_ctx, int ecn);
 
-    lsquic_engine_destroy(engine);
+    if(engine) lsquic_engine_destroy(engine);
     lsquic_global_cleanup();
     return 0;
 }
