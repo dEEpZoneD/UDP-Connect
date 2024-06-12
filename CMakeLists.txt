@@ -26,7 +26,7 @@ ADD_SUBDIRECTORY(lsquic/src/liblsquic)
 ADD_EXECUTABLE(udp_server udp_server.c)
 ADD_EXECUTABLE(udp_proxy udp_proxy.c)
 ADD_EXECUTABLE(client client.c)
-SET(LIBS lsquic crypto ssl z m)
+SET(LIBS lsquic crypto ssl z m event)
 IF(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # If using older glibc, need to link with -lrt.  See clock_getres(2).
     EXECUTE_PROCESS(

@@ -153,6 +153,10 @@ struct lsquic_stream_ctx {
     size_t               file_size; /* Used by pwritev */
 };
 
+struct sockaddr_in local_sa;
+struct sockaddr_in client_sa;
+struct sockaddr_in target_sa;
+
 int send_udp_data(struct sockaddr_in *target_addr, const char *data_buf, size_t buf_len) {
     int sockfd;
 
@@ -283,11 +287,11 @@ static int parse_request(struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h
     return -1; // Error
 }
 
-static int process_request(struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
-    if (st_h->req->protocol == "connect-udp") {
-        send_udp_data()
-    }
-}
+// static int process_request(struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
+//     if (st_h->req->protocol == "connect-udp") {
+//         send_udp_data();
+//     }
+// }
 
 static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
     struct lsquic_stream_ctx *st_h = h;
@@ -433,7 +437,7 @@ static void signal_handler(int signum) {
 void argument_parser(int argc, char** argv) {
     int opt;
     const char* optstring = "vp:l:";
-    while (opt = getopt(argc, argv, optstring)) {
+    while (opt = getopt(argc, argv, optstring) != -1) {
         switch(opt) {
             case 'p':
                 break;
@@ -455,6 +459,7 @@ void argument_parser(int argc, char** argv) {
                 }
                 break;
             default:
+                fprintf(stderr, "Unknown option\n");
                 exit(EXIT_FAILURE);
                 break;
         }
@@ -487,25 +492,48 @@ send_packets_out (void *packets_out_ctx, const struct lsquic_out_spec *specs,
     return (int) n;
 }
 
+void socket_callback(evutil_socket_t fd, short events, void *engine) {
+    if (events & EV_READ) {
+        // This might indicate incoming data or connection success
+        // Call lsquic functions to process the received packets
+        lsquic_engine_process_conns((lsquic_engine_t*)engine);
+
+        // Check if connection is established (update from lsquic callbacks)
+        // if (connection_established) {
+        //     // Connection successful, break the event loop
+        //     event_base_loopbreak(event_base_get_current());
+        // }
+    }
+    
+    // if (events & EV_TIMEOUT) {
+    //     // Timeout occurred
+    //     printf("Connection timeout!\n");
+    //     event_base_loopbreak(event_base_get_current());
+    // }
+}
+
 int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
     struct lsquic_engine_settings settings;
     struct server_ctx server_ctx;
     struct sockaddr* local_addr;
+    int sockfd;
 
     log_file = stderr;
     char errbuf[0x100];
+    lsquic_set_log_level("debug");
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER)) {
+        fprintf(stderr, "Global init failed\n");
         exit(EXIT_FAILURE);
     }
 
     memset(&server_ctx, 0, sizeof(server_ctx));
     memset(&engine_api, 0, sizeof(engine_api));
-    // int flags;
+    
 
     argument_parser(argc, argv);
-
+    printf("hello\n");
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
     settings.es_ql_bits = 0;
 
@@ -514,6 +542,23 @@ int main(int argc, char** argv) {
         LOG("invalid settings: %s", errbuf);
         exit(EXIT_FAILURE);
     }
+
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+    server_ctx.sockfd = sockfd;
+
+    socklen_t socklen = sizeof(local_sa);
+    if (0 != bind(sockfd, (struct sockaddr *)&local_sa, socklen))
+    {
+        perror("bind");
+        exit(EXIT_FAILURE);
+    }
+
+    // client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.125");
+
+    getsockname(sockfd, (struct sockaddr *)&local_sa, &socklen);
 
     setvbuf(log_file, NULL, _IOLBF, 0);
     lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
@@ -534,6 +579,20 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
     server_ctx.engine = engine;
+
+    struct event_base *base = event_base_new();
+    if (!base) {
+        perror("Couldn't create event_base");
+        return 1;
+    }
+
+    // Create event for the socket with a timeout of 30 seconds
+    struct event *socket_event = event_new(
+        base, sockfd, EV_READ | EV_PERSIST, socket_callback, engine);
+    event_add(socket_event, NULL);
+
+    // Event loop that keeps the program running until connection succeeds/fails
+    event_base_dispatch(base);
 
     int lsquic_engine_packet_in (lsquic_engine_t *,
         const unsigned char *udp_payload, size_t sz,
