@@ -583,6 +583,7 @@ int main(int argc, char** argv) {
     }
 
     getsockname(sockfd, (struct sockaddr *)&local_sa, &socklen);
+    fprintf(stderr, "bound to port:%d, sockfd:%d\n", local_sa.sin_port, sockfd);
 
     setvbuf(log_file, NULL, _IOLBF, 0);
     lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
