@@ -66,6 +66,7 @@ struct server_ctx
 {
     struct lsquic_conn_ctx  *conn_h;
     lsquic_engine_t *engine;
+    struct sockaddr_in *local_sa;
     int sockfd;
     unsigned max_conn;
     unsigned n_conn;
@@ -511,6 +512,31 @@ void socket_callback(evutil_socket_t fd, short events, void *engine) {
     //     event_base_loopbreak(event_base_get_current());
     // }
 }
+int read_socket(evutil_socket_t fd, short events, void *arg) {
+    struct server_ctx *server_ctx = (struct server_ctx*)arg;
+    ssize_t nread;
+    struct sockaddr_in *peer_sa, *local_sa;
+    unsigned char buf[0x1000];
+    struct msghdr msg = {
+        .msg_name       = &peer_sa,
+        .msg_namelen    = sizeof(peer_sa),
+        // .msg_iov        = specs[n].iov,
+        // .msg_iovlen     = specs[n].iovlen,
+    };
+    nread = recvmsg(fd, &msg, 0);
+    if (-1 == nread) {
+        if (!(EAGAIN == errno || EWOULDBLOCK == errno))
+            LOG("recvmsg: %s", strerror(errno));
+        return;
+    }
+    local_sa = (server_ctx->local_sa);
+
+    (void) lsquic_engine_packet_in(server_ctx->engine, buf, nread,
+        (struct sockaddr *) &local_sa,
+        (struct sockaddr *) &peer_sa, 0, 0);
+
+    lsquic_engine_process_conns(server_ctx->engine);
+}
 
 int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
@@ -556,8 +582,6 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
-    // client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.125");
-
     getsockname(sockfd, (struct sockaddr *)&local_sa, &socklen);
 
     setvbuf(log_file, NULL, _IOLBF, 0);
@@ -588,7 +612,7 @@ int main(int argc, char** argv) {
 
     // Create event for the socket with a timeout of 30 seconds
     struct event *socket_event = event_new(
-        base, sockfd, EV_READ | EV_PERSIST, socket_callback, engine);
+        base, sockfd, EV_READ | EV_PERSIST, read_socket, engine);
     event_add(socket_event, NULL);
 
     // Event loop that keeps the program running until connection succeeds/fails
