@@ -17,6 +17,9 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#define EV_STANDALONE 1
+#define EV_API_STATIC 1
+#include "ev.c"
 #include "lsquic.h"
 // #include "../src/liblsquic/lsquic_hash.h"
 #include "../src/liblsquic/lsquic_logger.h"
@@ -598,6 +601,8 @@ int main(int argc, char** argv) {
     engine_api.ea_stream_if_ctx = &server_ctx;
     engine_api.ea_settings = &settings;
 
+    struct ev_loop *ev = EV_DEFAULT;
+
     lsquic_engine_t *engine = lsquic_engine_new(LSENG_SERVER|LSENG_HTTP, &engine_api);
     if (!engine) {
         fprintf(stderr, "cannot create engine\n");
@@ -605,19 +610,19 @@ int main(int argc, char** argv) {
     }
     server_ctx.engine = engine;
 
-    struct event_base *base = event_base_new();
-    if (!base) {
-        perror("Couldn't create event_base");
-        return 1;
-    }
+    // struct event_base *base = event_base_new();
+    // if (!base) {
+    //     perror("Couldn't create event_base");
+    //     return 1;
+    // }
 
-    // Create event for the socket with a timeout of 30 seconds
-    struct event *socket_event = event_new(
-        base, sockfd, EV_READ | EV_PERSIST, read_socket, engine);
-    event_add(socket_event, NULL);
+    // // Create event for the socket with a timeout of 30 seconds
+    // struct event *socket_event = event_new(
+    //     base, sockfd, EV_READ | EV_PERSIST, read_socket, engine);
+    // event_add(socket_event, NULL);
 
-    // Event loop that keeps the program running until connection succeeds/fails
-    event_base_dispatch(base);
+    // // Event loop that keeps the program running until connection succeeds/fails
+    // event_base_dispatch(base);
 
     int lsquic_engine_packet_in (lsquic_engine_t *,
         const unsigned char *udp_payload, size_t sz,

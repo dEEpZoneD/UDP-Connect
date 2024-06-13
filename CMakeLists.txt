@@ -22,7 +22,7 @@ INCLUDE_DIRECTORIES(lsquic/bin)
 INCLUDE_DIRECTORIES(lsquic/src/liblsquic)       # For lsquic_xxhash.h
 ADD_SUBDIRECTORY(lsquic/src/liblsquic)
 
-# INCLUDE_DIRECTORIES(libev)
+INCLUDE_DIRECTORIES(libev)
 ADD_EXECUTABLE(udp_server udp_server.c)
 ADD_EXECUTABLE(udp_proxy udp_proxy.c)
 ADD_EXECUTABLE(client client.c)

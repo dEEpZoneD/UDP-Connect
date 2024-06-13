@@ -402,13 +402,14 @@ void argument_parser(int argc, char** argv) {
                 }
                 break;
             case 'p':
-                if (inet_pton(AF_INET, optarg, &proxy_sa.sin_addr) != 1) {
-                    fprintf(stderr, "Invalid proxy server IP address <%s>\n", optarg);
-                    exit(EXIT_FAILURE);
-                }
+                // if (inet_pton(AF_INET, optarg, &proxy_sa.sin_addr) != 1) {
+                //     fprintf(stderr, "Invalid proxy server IP address <%s>\n", optarg);
+                //     exit(EXIT_FAILURE);
+                // }
                 // char ip_str[INET_ADDRSTRLEN];
                 // inet_ntop(AF_INET, &proxy_addr.addr4, ip_str, INET_ADDRSTRLEN);
                 // printf("%s\n", ip_str);
+                proxy_sa.sin_port = atoi(optarg);
                 break;
             case 't':
                 if (inet_pton(AF_INET, optarg, &target_sa.sin_addr) != 1) {
@@ -456,16 +457,16 @@ int main(int argc, char** argv) {
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
     proxy_sa.sin_addr.s_addr = inet_addr("192.168.122.51");  /*www.proxy.com*/
-    proxy_sa.sin_port = 2482;
+    proxy_sa.sin_port = 54669;
 
-    if ((client_ctx.sockfd = socket(proxy_sa.sin_family, SOCK_DGRAM, 0)) < 0) {
+    if ((sockfd = socket(proxy_sa.sin_family, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
     // client_ctx.sockfd = sockfd;
 
     socklen = sizeof(local_sa);
-    if (0 != bind(client_ctx.sockfd, (struct sockaddr *)&local_sa, socklen))
+    if (0 != bind(sockfd, (struct sockaddr *)&local_sa, socklen))
     {
         perror("bind");
         exit(EXIT_FAILURE);
@@ -473,9 +474,10 @@ int main(int argc, char** argv) {
 
     // client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.125");
 
-    getsockname(client_ctx.sockfd, &(local_sa), &socklen);
+    getsockname(sockfd, &(local_sa), &socklen);
     fprintf(stderr, "Socket bound to port %d and fd: %d\n", ntohs(local_sa.sin_port), client_ctx.sockfd);
     client_ctx.local_sa = &local_sa;
+    client_ctx.sockfd = sockfd;
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
         fprintf(stderr, "lsquic global initialisation failed");
@@ -537,21 +539,21 @@ int main(int argc, char** argv) {
         LOG("cannot create connection");
         exit(EXIT_FAILURE);
     }
-    struct event_base *base = event_base_new();
-    if (!base) {
-        perror("Couldn't create event_base");
-        return 1;
-    }
+    // struct event_base *base = event_base_new();
+    // if (!base) {
+    //     perror("Couldn't create event_base");
+    //     return 1;
+    // }
 
-    // Create event for the socket with a timeout of 30 seconds
-    struct event *socket_event = event_new(
-        base, sockfd, EV_READ | EV_PERSIST, read_socket, &client_ctx);
-    event_add(socket_event, NULL);
+    // // Create event for the socket with a timeout of 30 seconds
+    // struct event *socket_event = event_new(
+    //     base, sockfd, EV_READ | EV_PERSIST, read_socket, &client_ctx);
+    // event_add(socket_event, NULL);
 
-    // Event loop that keeps the program running until connection succeeds/fails
-    event_base_dispatch(base);
-    // LOG("engine_process_conns called");
-    // while(1) lsquic_engine_process_conns(engine);
+    // // Event loop that keeps the program running until connection succeeds/fails
+    // event_base_dispatch(base);
+    LOG("engine_process_conns called");
+    while(1) lsquic_engine_process_conns(engine);
     
     if (conn_ctx.conn) {
         LOG("Closing connection");
