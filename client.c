@@ -31,7 +31,7 @@ static FILE *log_file;
 
 struct lsquic_http_headers headers;
 
-typedef struct
+struct proxy_client_ctx
 {
     lsquic_engine_t *engine;
     // char payload_sizep[20];
@@ -47,16 +47,18 @@ typedef struct
     const char *scheme;
     const char *authority;
     const char *payload;
-}proxy_client_ctx;
+};
+
+typedef struct proxy_client_ctx proxy_client_ctx_t;
 
 struct lsquic_conn_ctx {
     lsquic_conn_t *conn;
-    proxy_client_ctx *client_ctx;
+    proxy_client_ctx_t *client_ctx;
 };
 
 struct lsquic_stream_ctx {
     lsquic_stream_t     *stream;
-    proxy_client_ctx   *client_ctx;
+    proxy_client_ctx_t   *client_ctx;
     enum {
         HEADERS_SENT    = (1 << 0),
         PROCESSED_HEADERS = 1 << 1,
@@ -99,7 +101,7 @@ LOG (const char *fmt, ...)
 }
 
 int read_socket(evutil_socket_t fd, short events, void *arg) {
-    proxy_client_ctx *client_ctx = (proxy_client_ctx*)arg;
+    proxy_client_ctx_t *client_ctx = (proxy_client_ctx_t*)arg;
     ssize_t nread;
     struct sockaddr_in *peer_sa, *local_sa;
     unsigned char buf[0x1000];
@@ -125,7 +127,7 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
 }
 
 static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spec *specs, unsigned count) {
-    proxy_client_ctx *client_ctx = packets_out_ctx;
+    proxy_client_ctx_t *client_ctx = packets_out_ctx;
     unsigned n;
     int fd, s = 0;
     struct msghdr msg;
@@ -171,7 +173,7 @@ static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spe
 }
 
 static lsquic_conn_ctx_t *my_client_on_new_conn(void *stream_if_ctx, struct lsquic_conn *conn) {
-    // proxy_client_ctx *client_ctc = stream_if_ctx;
+    // proxy_client_ctx_t *client_ctc = stream_if_ctx;
     lsquic_conn_ctx_t *conn_h = stream_if_ctx;
     conn_h->conn = conn;
     lsquic_conn_make_stream(conn);
@@ -181,7 +183,7 @@ static lsquic_conn_ctx_t *my_client_on_new_conn(void *stream_if_ctx, struct lsqu
 
 static void my_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status) {
     lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
-    proxy_client_ctx *client_ctx = conn_h->client_ctx;
+    proxy_client_ctx_t *client_ctx = conn_h->client_ctx;
 
     if (status == LSQ_HSK_OK || status == LSQ_HSK_RESUMED_OK) {
         LOG("Handshake successful%s",
@@ -263,7 +265,7 @@ client_set_header (struct lsxpack_header *hdr, struct header_buf *header_buf,
 
 static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
     lsquic_conn_t *conn;
-    proxy_client_ctx *client_ctx;
+    proxy_client_ctx_t *client_ctx;
     lsquic_stream_ctx_t *st_f = h;
     struct header_buf hbuf;
     struct lsxpack_header harray[5];
@@ -441,7 +443,7 @@ int main(int argc, char** argv) {
     struct lsquic_engine_settings settings;
     socklen_t socklen;
     int sockfd;
-    proxy_client_ctx client_ctx;
+    proxy_client_ctx_t client_ctx;
     memset(&client_ctx, 0, sizeof(client_ctx));
 
     log_file = stderr;
@@ -456,7 +458,7 @@ int main(int argc, char** argv) {
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
     proxy_sa.sin_addr.s_addr = inet_addr("192.168.122.51");  /*www.proxy.com*/
-    proxy_sa.sin_port = 2482;
+    proxy_sa.sin_port = 21207;
 
     if ((client_ctx.sockfd = socket(proxy_sa.sin_family, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
@@ -537,21 +539,23 @@ int main(int argc, char** argv) {
         LOG("cannot create connection");
         exit(EXIT_FAILURE);
     }
-    struct event_base *base = event_base_new();
-    if (!base) {
-        perror("Couldn't create event_base");
-        return 1;
-    }
+    // struct event_base *base = event_base_new();
+    // if (!base) {
+    //     perror("Couldn't create event_base");
+    //     return 1;
+    // }
 
-    // Create event for the socket with a timeout of 30 seconds
-    struct event *socket_event = event_new(
-        base, sockfd, EV_READ | EV_PERSIST, read_socket, &client_ctx);
-    event_add(socket_event, NULL);
+    // // Create event for the socket with a timeout of 30 seconds
+    // struct event *socket_event = event_new(
+    //     base, sockfd, EV_READ | EV_PERSIST, read_socket, &client_ctx);
+    // event_add(socket_event, NULL);
 
-    // Event loop that keeps the program running until connection succeeds/fails
-    event_base_dispatch(base);
+    // // Event loop that keeps the program running until connection succeeds/fails
+    // event_base_dispatch(base);
+
+
     // LOG("engine_process_conns called");
-    // while(1) lsquic_engine_process_conns(engine);
+    lsquic_engine_process_conns(engine);
     
     if (conn_ctx.conn) {
         LOG("Closing connection");

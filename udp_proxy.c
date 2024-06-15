@@ -437,8 +437,7 @@ static void signal_handler(int signum) {
 
 void argument_parser(int argc, char** argv) {
     int opt;
-    const char* optstring = "vp:l:";
-    while (opt = getopt(argc, argv, optstring) != -1) {
+    while ((opt = getopt(argc, argv, "l:p:v")) != -1) {
         switch(opt) {
             case 'p':
                 break;
@@ -493,49 +492,33 @@ send_packets_out (void *packets_out_ctx, const struct lsquic_out_spec *specs,
     return (int) n;
 }
 
-void socket_callback(evutil_socket_t fd, short events, void *engine) {
-    if (events & EV_READ) {
-        // This might indicate incoming data or connection success
-        // Call lsquic functions to process the received packets
-        lsquic_engine_process_conns((lsquic_engine_t*)engine);
-
-        // Check if connection is established (update from lsquic callbacks)
-        // if (connection_established) {
-        //     // Connection successful, break the event loop
-        //     event_base_loopbreak(event_base_get_current());
-        // }
-    }
-    
-    // if (events & EV_TIMEOUT) {
-    //     // Timeout occurred
-    //     printf("Connection timeout!\n");
-    //     event_base_loopbreak(event_base_get_current());
-    // }
-}
 int read_socket(evutil_socket_t fd, short events, void *arg) {
     struct server_ctx *server_ctx = (struct server_ctx*)arg;
     ssize_t nread;
-    struct sockaddr_in *peer_sa, *local_sa;
+    struct sockaddr_in *local_sa;
+    struct sockaddr_storage peer_addr_storage;
+    struct sockaddr *peer_sa = (struct sockaddr *)&peer_addr_storage;
     unsigned char buf[0x1000];
     struct msghdr msg = {
         .msg_name       = &peer_sa,
-        .msg_namelen    = sizeof(peer_sa),
+        .msg_namelen    = sizeof(peer_addr_storage),
         // .msg_iov        = specs[n].iov,
         // .msg_iovlen     = specs[n].iovlen,
     };
     nread = recvmsg(fd, &msg, 0);
-    if (-1 == nread) {
-        if (!(EAGAIN == errno || EWOULDBLOCK == errno))
+    if (0 < nread) {
+        if (!(EAGAIN == errno || EWOULDBLOCK == errno || ECONNRESET == errno))
             LOG("recvmsg: %s", strerror(errno));
         return;
     }
+    if (nread == 0) return 0;
     local_sa = (server_ctx->local_sa);
 
     (void) lsquic_engine_packet_in(server_ctx->engine, buf, nread,
         (struct sockaddr *) &local_sa,
         (struct sockaddr *) &peer_sa, 0, 0);
 
-    lsquic_engine_process_conns(server_ctx->engine);
+    // lsquic_engine_process_conns(server_ctx->engine);
 }
 
 int main(int argc, char** argv) {
@@ -547,7 +530,8 @@ int main(int argc, char** argv) {
 
     log_file = stderr;
     char errbuf[0x100];
-    lsquic_set_log_level("debug");
+
+    argument_parser(argc, argv);
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER)) {
         fprintf(stderr, "Global init failed\n");
@@ -557,8 +541,6 @@ int main(int argc, char** argv) {
     memset(&server_ctx, 0, sizeof(server_ctx));
     memset(&engine_api, 0, sizeof(engine_api));
     
-
-    argument_parser(argc, argv);
     printf("hello\n");
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
     settings.es_ql_bits = 0;
@@ -584,6 +566,7 @@ int main(int argc, char** argv) {
 
     getsockname(sockfd, (struct sockaddr *)&local_sa, &socklen);
     fprintf(stderr, "bound to port:%d, sockfd:%d\n", local_sa.sin_port, sockfd);
+    server_ctx.local_sa = &local_sa;
 
     setvbuf(log_file, NULL, _IOLBF, 0);
     lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
@@ -617,13 +600,18 @@ int main(int argc, char** argv) {
     event_add(socket_event, NULL);
 
     // Event loop that keeps the program running until connection succeeds/fails
-    event_base_dispatch(base);
+    while (1)
+    {
+        event_base_dispatch(base);
 
-    int lsquic_engine_packet_in (lsquic_engine_t *,
-        const unsigned char *udp_payload, size_t sz,
-        const struct sockaddr *sa_local,
-        const struct sockaddr *sa_peer,
-        void *peer_ctx, int ecn);
+        lsquic_engine_process_conns(engine);
+    }
+
+    // int lsquic_engine_packet_in (lsquic_engine_t *,
+    //     const unsigned char *udp_payload, size_t sz,
+    //     const struct sockaddr *sa_local,
+    //     const struct sockaddr *sa_peer,
+    //     void *peer_ctx, int ecn);
 
     if(engine) lsquic_engine_destroy(engine);
     lsquic_global_cleanup();
