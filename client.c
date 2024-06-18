@@ -458,7 +458,7 @@ int main(int argc, char** argv) {
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
     proxy_sa.sin_addr.s_addr = inet_addr("192.168.122.51");  /*www.proxy.com*/
-    proxy_sa.sin_port = 21207;
+    proxy_sa.sin_port = 62157;
 
     if ((client_ctx.sockfd = socket(proxy_sa.sin_family, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
@@ -555,7 +555,7 @@ int main(int argc, char** argv) {
 
 
     // LOG("engine_process_conns called");
-    lsquic_engine_process_conns(engine);
+    while (1) lsquic_engine_process_conns(engine);
     
     if (conn_ctx.conn) {
         LOG("Closing connection");

@@ -511,14 +511,16 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
             LOG("recvmsg: %s", strerror(errno));
         return;
     }
-    if (nread == 0) return 0;
+    // if (nread == 0) return 0;
     local_sa = (server_ctx->local_sa);
 
     (void) lsquic_engine_packet_in(server_ctx->engine, buf, nread,
         (struct sockaddr *) &local_sa,
         (struct sockaddr *) &peer_sa, 0, 0);
-
-    // lsquic_engine_process_conns(server_ctx->engine);
+    int diff;
+    while (lsquic_engine_earliest_adv_tick(server_ctx->engine, &diff) <= 1) {
+        lsquic_engine_process_conns(server_ctx->engine);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -600,12 +602,15 @@ int main(int argc, char** argv) {
     event_add(socket_event, NULL);
 
     // Event loop that keeps the program running until connection succeeds/fails
-    while (1)
-    {
-        event_base_dispatch(base);
+    
+    event_base_dispatch(base);
+    
+    // while (1)
+    // {
+    //     event_base_dispatch(base);
 
-        lsquic_engine_process_conns(engine);
-    }
+    //     lsquic_engine_process_conns(engine);
+    // }
 
     // int lsquic_engine_packet_in (lsquic_engine_t *,
     //     const unsigned char *udp_payload, size_t sz,
