@@ -123,7 +123,10 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
         (struct sockaddr *) &local_sa,
         (struct sockaddr *) &peer_sa, 0, 0);
 
-    lsquic_engine_process_conns(client_ctx->engine);
+    int diff;
+    while (lsquic_engine_earliest_adv_tick(client_ctx->engine, &diff) <= 1) {
+        lsquic_engine_process_conns(client_ctx->engine);
+    }
 }
 
 static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spec *specs, unsigned count) {
@@ -458,7 +461,7 @@ int main(int argc, char** argv) {
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
     proxy_sa.sin_addr.s_addr = inet_addr("192.168.122.51");  /*www.proxy.com*/
-    proxy_sa.sin_port = 62157;
+    proxy_sa.sin_port = 43228;
 
     if ((client_ctx.sockfd = socket(proxy_sa.sin_family, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
@@ -519,7 +522,6 @@ int main(int argc, char** argv) {
         LOG("cannot create engine\n");
         exit(EXIT_FAILURE);
     }
-
     
     struct lsquic_conn_ctx conn_ctx;
     conn_ctx.client_ctx = &client_ctx;
@@ -539,23 +541,26 @@ int main(int argc, char** argv) {
         LOG("cannot create connection");
         exit(EXIT_FAILURE);
     }
-    // struct event_base *base = event_base_new();
-    // if (!base) {
-    //     perror("Couldn't create event_base");
-    //     return 1;
-    // }
+    lsquic_engine_process_conns(engine);
+    
+    struct event_base *base = event_base_new();
+    if (!base) {
+        perror("Couldn't create event_base");
+        return 1;
+    }
 
-    // // Create event for the socket with a timeout of 30 seconds
-    // struct event *socket_event = event_new(
-    //     base, sockfd, EV_READ | EV_PERSIST, read_socket, &client_ctx);
-    // event_add(socket_event, NULL);
+    // Create event for the socket with a timeout of 30 seconds
+    struct event *socket_event = event_new(
+        base, client_ctx.sockfd, EV_READ | EV_PERSIST, read_socket, &client_ctx);
+    event_add(socket_event, NULL);
 
-    // // Event loop that keeps the program running until connection succeeds/fails
-    // event_base_dispatch(base);
+    // Event loop that keeps the program running until connection succeeds/fails
+    
+    event_base_dispatch(base);
 
 
     // LOG("engine_process_conns called");
-    while (1) lsquic_engine_process_conns(engine);
+    // while (1) lsquic_engine_process_conns(engine);
     
     if (conn_ctx.conn) {
         LOG("Closing connection");

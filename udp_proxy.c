@@ -468,9 +468,7 @@ void argument_parser(int argc, char** argv) {
 
 /* Return number of packets sent or -1 on error */
 static int
-send_packets_out (void *packets_out_ctx, const struct lsquic_out_spec *specs,
-                                                unsigned n_specs)
-{
+send_packets_out (void *packets_out_ctx, const struct lsquic_out_spec *specs, unsigned n_specs) {
     struct server_ctx *server_ctx = packets_out_ctx;
     struct msghdr msg;
     int sockfd;
@@ -527,7 +525,7 @@ int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
     struct lsquic_engine_settings settings;
     struct server_ctx server_ctx;
-    struct sockaddr* local_addr;
+    struct sockaddr_in local_addr;
     int sockfd;
 
     log_file = stderr;
@@ -558,6 +556,11 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
     server_ctx.sockfd = sockfd;
+
+    memset(&local_sa, 0, sizeof(local_sa));
+    local_sa.sin_family = AF_INET;
+    local_sa.sin_addr.s_addr = inet_addr("192.168.122.51");
+    local_sa.sin_port = 51813;
 
     socklen_t socklen = sizeof(local_sa);
     if (0 != bind(sockfd, (struct sockaddr *)&local_sa, socklen))
