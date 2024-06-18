@@ -47,7 +47,7 @@ my_log_buf (void *ctx, const char *buf, size_t len)
 }
 static const struct lsquic_logger_if logger_if = { my_log_buf, };
 
-static int s_verbose;
+static int s_verbose = 0;
 static void
 LOG (const char *fmt, ...)
 {
@@ -490,35 +490,70 @@ send_packets_out (void *packets_out_ctx, const struct lsquic_out_spec *specs, un
     return (int) n;
 }
 
+void print_packet_hex(const uint8_t *packet_data, int num_bytes) {
+    fprintf(log_file, "Received Packet (%d bytes):\n", num_bytes);
+    
+    // Determine the maximum byte index for formatting (e.g., 99 for 100 bytes)
+    int max_index = num_bytes - 1;
+    int index_width = snprintf(NULL, 0, "%d", max_index);
+    fprintf(log_file, "%*d: ", index_width, 0);
+    for (int i = 0; i < num_bytes; i++) {
+        fprintf(log_file, "%02X", packet_data[i]); 
+
+        // Optional: Group bytes for readability
+        if (i == num_bytes - 1) fprintf(log_file, "\n");
+        else if ((i + 1) % 16 == 0) { 
+            fprintf(log_file, "\n");
+            fprintf(log_file, "%*d: ", index_width, i);
+        } 
+        else {
+            fprintf(log_file, "  "); 
+        }
+    }
+}
+
 int read_socket(evutil_socket_t fd, short events, void *arg) {
     struct server_ctx *server_ctx = (struct server_ctx*)arg;
+    lsquic_engine_t *engine = (lsquic_engine_t *)arg;
     ssize_t nread;
-    struct sockaddr_in *local_sa;
+    struct sockaddr_in local_sa = *(server_ctx->local_sa);
     struct sockaddr_storage peer_addr_storage;
     struct sockaddr *peer_sa = (struct sockaddr *)&peer_addr_storage;
     unsigned char buf[0x1000];
+    struct iovec iov[1] = {{ buf, sizeof(buf) }};;
+    unsigned char ctl_buf[1024];
+
     struct msghdr msg = {
         .msg_name       = &peer_sa,
         .msg_namelen    = sizeof(peer_addr_storage),
-        // .msg_iov        = specs[n].iov,
-        // .msg_iovlen     = specs[n].iovlen,
+        .msg_iov        = iov,
+        .msg_iovlen     = 1,
+        .msg_control    = ctl_buf,
+        .msg_controllen = 1024,
     };
+    
     nread = recvmsg(fd, &msg, 0);
-    if (0 < nread) {
+    if (0 > nread) {
+        LOG("got -1 from recvmsg");
         if (!(EAGAIN == errno || EWOULDBLOCK == errno || ECONNRESET == errno))
             LOG("recvmsg: %s", strerror(errno));
         return;
     }
-    // if (nread == 0) return 0;
-    local_sa = (server_ctx->local_sa);
 
+    if (nread == 0) return;
+    if (s_verbose) print_packet_hex(buf, nread);
+    LOG("Providing packets to engine");
     (void) lsquic_engine_packet_in(server_ctx->engine, buf, nread,
-        (struct sockaddr *) &local_sa,
-        (struct sockaddr *) &peer_sa, 0, 0);
-    int diff;
+        (struct sockaddr *) (server_ctx->local_sa),
+        peer_sa, fd, 0);
+    
+    int diff = 0;
+    LOG("adv_tick");
     while (lsquic_engine_earliest_adv_tick(server_ctx->engine, &diff) <= 1) {
+        LOG("process_conn");
         lsquic_engine_process_conns(server_ctx->engine);
     }
+    printf("read_socket enf\n");
 }
 
 int main(int argc, char** argv) {
@@ -596,30 +631,14 @@ int main(int argc, char** argv) {
     struct event_base *base = event_base_new();
     if (!base) {
         perror("Couldn't create event_base");
-        return 1;
+        exit(EXIT_FAILURE);
     }
 
-    // Create event for the socket with a timeout of 30 seconds
     struct event *socket_event = event_new(
-        base, sockfd, EV_READ | EV_PERSIST, read_socket, engine);
+        base, sockfd, EV_READ | EV_PERSIST, read_socket, &server_ctx);
     event_add(socket_event, NULL);
-
-    // Event loop that keeps the program running until connection succeeds/fails
     
     event_base_dispatch(base);
-    
-    // while (1)
-    // {
-    //     event_base_dispatch(base);
-
-    //     lsquic_engine_process_conns(engine);
-    // }
-
-    // int lsquic_engine_packet_in (lsquic_engine_t *,
-    //     const unsigned char *udp_payload, size_t sz,
-    //     const struct sockaddr *sa_local,
-    //     const struct sockaddr *sa_peer,
-    //     void *peer_ctx, int ecn);
 
     if(engine) lsquic_engine_destroy(engine);
     lsquic_global_cleanup();

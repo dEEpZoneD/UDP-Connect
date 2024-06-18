@@ -100,33 +100,70 @@ LOG (const char *fmt, ...)
     }
 }
 
+void print_packet_hex(const uint8_t *packet_data, int num_bytes) {
+    fprintf(log_file, "Received Packet (%d bytes):\n", num_bytes);
+    
+    // Determine the maximum byte index for formatting (e.g., 99 for 100 bytes)
+    int max_index = num_bytes - 1;
+    int index_width = snprintf(NULL, 0, "%d", max_index);
+    fprintf(log_file, "%*d: ", index_width, 0);
+    for (int i = 0; i < num_bytes; i++) {
+        fprintf(log_file, "%02X", packet_data[i]); 
+
+        // Optional: Group bytes for readability
+        if (i == num_bytes - 1) fprintf(log_file, "\n");
+        else if ((i + 1) % 16 == 0) { 
+            fprintf(log_file, "\n");
+            fprintf(log_file, "%*d: ", index_width, i);
+        } 
+        else {
+            fprintf(log_file, "  "); 
+        }
+    }
+}
+
 int read_socket(evutil_socket_t fd, short events, void *arg) {
     proxy_client_ctx_t *client_ctx = (proxy_client_ctx_t*)arg;
+    lsquic_engine_t *engine = (lsquic_engine_t *)arg;
     ssize_t nread;
-    struct sockaddr_in *peer_sa, *local_sa;
+    struct sockaddr_in local_sa = *(client_ctx->local_sa);
+    struct sockaddr_storage peer_addr_storage;
+    struct sockaddr *peer_sa = (struct sockaddr *)&peer_addr_storage;
     unsigned char buf[0x1000];
+    struct iovec iov[1] = {{ buf, sizeof(buf) }};;
+    unsigned char ctl_buf[1024];
+
     struct msghdr msg = {
         .msg_name       = &peer_sa,
-        .msg_namelen    = sizeof(peer_sa),
-        // .msg_iov        = specs[n].iov,
-        // .msg_iovlen     = specs[n].iovlen,
+        .msg_namelen    = sizeof(peer_addr_storage),
+        .msg_iov        = iov,
+        .msg_iovlen     = 1,
+        .msg_control    = ctl_buf,
+        .msg_controllen = 1024,
     };
+    
     nread = recvmsg(fd, &msg, 0);
-    if (-1 == nread) {
-        if (!(EAGAIN == errno || EWOULDBLOCK == errno))
+    if (0 > nread) {
+        LOG("got -1 from recvmsg");
+        if (!(EAGAIN == errno || EWOULDBLOCK == errno || ECONNRESET == errno))
             LOG("recvmsg: %s", strerror(errno));
         return;
     }
-    local_sa = (client_ctx->local_sa);
 
+    if (nread == 0) return;
+    if (s_verbose) print_packet_hex(buf, nread);
+    LOG("Providing packets to engine");
     (void) lsquic_engine_packet_in(client_ctx->engine, buf, nread,
-        (struct sockaddr *) &local_sa,
-        (struct sockaddr *) &peer_sa, 0, 0);
-
-    int diff;
+        (struct sockaddr *) (client_ctx->local_sa),
+        peer_sa, fd, 0);
+    
+    int diff = 0;
+    LOG("adv_tick");
     while (lsquic_engine_earliest_adv_tick(client_ctx->engine, &diff) <= 1) {
+        LOG("process_conn");
         lsquic_engine_process_conns(client_ctx->engine);
     }
+    printf("read_socket enf\n");
 }
 
 static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spec *specs, unsigned count) {
