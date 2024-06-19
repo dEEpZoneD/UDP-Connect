@@ -522,8 +522,8 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
     struct sockaddr_in local_sa = *(server_ctx.local_sa);
     struct sockaddr_storage peer_addr_storage;
     struct sockaddr *peer_sa = (struct sockaddr *)&peer_addr_storage;
-    unsigned char buf[0x1000];
-    struct iovec iov[1] = {{ buf, sizeof(buf) }};;
+    unsigned char *buf = malloc(4096);
+    struct iovec iov[1] = {{ buf, 4096 }};
     unsigned char ctl_buf[1024];
 
     struct msghdr msg = {
@@ -546,9 +546,9 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
     if (nread == 0) return;
     if (s_verbose) print_packet_hex(buf, nread);
     LOG("Providing packets to engine");
-    (void) lsquic_engine_packet_in(server_ctx.engine, buf, nread,
+    lsquic_engine_packet_in(server_ctx.engine, buf, nread,
         (struct sockaddr *) (server_ctx.local_sa),
-        peer_sa, (void*) &fd, 0);
+        peer_sa, NULL, 0);
     
     int diff = 0;
     LOG("adv_tick");
