@@ -79,6 +79,8 @@ struct server_ctx
     char *authority;
 };
 
+struct server_ctx server_ctx;
+
 struct lsquic_conn_ctx
 {
     lsquic_conn_t *conn;
@@ -183,6 +185,7 @@ int send_udp_data(struct sockaddr_in *target_addr, const char *data_buf, size_t 
 }
 
 static lsquic_conn_ctx_t *server_on_new_conn(void *stream_if_ctx, struct lsquic_conn *conn) {
+    LOG("on_new_conn called");
     struct server_ctx *server_ctx = stream_if_ctx;
     // const char *sni;
 
@@ -202,7 +205,7 @@ server_on_goaway (lsquic_conn_t *conn)
 {
     lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
     conn_h->flags |= RECEIVED_GOAWAY;
-    LSQ_INFO("received GOAWAY");
+    LOG("received GOAWAY");
 }
 
 static void server_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status);
@@ -513,10 +516,10 @@ void print_packet_hex(const uint8_t *packet_data, int num_bytes) {
 }
 
 int read_socket(evutil_socket_t fd, short events, void *arg) {
-    struct server_ctx *server_ctx = (struct server_ctx*)arg;
+    // struct server_ctx *server_ctx = (struct server_ctx*)arg;
     lsquic_engine_t *engine = (lsquic_engine_t *)arg;
     ssize_t nread;
-    struct sockaddr_in local_sa = *(server_ctx->local_sa);
+    struct sockaddr_in local_sa = *(server_ctx.local_sa);
     struct sockaddr_storage peer_addr_storage;
     struct sockaddr *peer_sa = (struct sockaddr *)&peer_addr_storage;
     unsigned char buf[0x1000];
@@ -543,24 +546,23 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
     if (nread == 0) return;
     if (s_verbose) print_packet_hex(buf, nread);
     LOG("Providing packets to engine");
-    (void) lsquic_engine_packet_in(server_ctx->engine, buf, nread,
-        (struct sockaddr *) (server_ctx->local_sa),
-        peer_sa, fd, 0);
+    (void) lsquic_engine_packet_in(server_ctx.engine, buf, nread,
+        (struct sockaddr *) (server_ctx.local_sa),
+        peer_sa, (void*) &fd, 0);
     
     int diff = 0;
     LOG("adv_tick");
-    while (lsquic_engine_earliest_adv_tick(server_ctx->engine, &diff) <= 1) {
+    while (lsquic_engine_earliest_adv_tick(server_ctx.engine, &diff) <= 1) {
         LOG("process_conn");
-        lsquic_engine_process_conns(server_ctx->engine);
+        lsquic_engine_process_conns(server_ctx.engine);
     }
-    printf("read_socket enf\n");
+    LOG("read_socket enf");
 }
 
 int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
     struct lsquic_engine_settings settings;
-    struct server_ctx server_ctx;
-    struct sockaddr_in local_addr;
+    // struct server_ctx server_ctx;
     int sockfd;
 
     log_file = stderr;
@@ -635,7 +637,7 @@ int main(int argc, char** argv) {
     }
 
     struct event *socket_event = event_new(
-        base, sockfd, EV_READ | EV_PERSIST, read_socket, &server_ctx);
+        base, sockfd, EV_READ | EV_PERSIST, read_socket, (void*) &server_ctx);
     event_add(socket_event, NULL);
     
     event_base_dispatch(base);
