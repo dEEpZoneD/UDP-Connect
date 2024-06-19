@@ -526,11 +526,10 @@ int main(int argc, char** argv) {
 
     argument_parser(argc, argv);
 
-    lsquic_engine_init_settings(&settings, LSENG_HTTP);
+    lsquic_engine_init_settings(&settings, 0);
     // settings.es_ql_bits = 0;
 
-    if (0 != lsquic_engine_check_settings(&settings, LSENG_HTTP,
-    errbuf, sizeof(errbuf))) {
+    if (0 != lsquic_engine_check_settings(&settings, 0, errbuf, sizeof(errbuf))) {
         LOG("invalid settings: %s", errbuf);
         exit(EXIT_FAILURE);
     }

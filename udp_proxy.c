@@ -66,7 +66,7 @@ struct server_ctx
 {
     struct lsquic_conn_ctx  *conn_h;
     lsquic_engine_t *engine;
-    struct sockaddr_in *local_sa;
+    struct sockaddr_in local_sa;
     int sockfd;
     unsigned max_conn;
     unsigned n_conn;
@@ -80,6 +80,8 @@ struct server_ctx
 };
 
 struct server_ctx server_ctx;
+struct lsquic_engine_api engine_api;
+    struct lsquic_engine_settings settings;
 
 struct lsquic_conn_ctx
 {
@@ -156,9 +158,105 @@ struct lsquic_stream_ctx {
     size_t               file_size; /* Used by pwritev */
 };
 
-struct sockaddr_in local_sa;
 struct sockaddr_in client_sa;
 struct sockaddr_in target_sa;
+
+static SSL_CTX *s_ssl_ctx;
+const char *cert_file = NULL, *key_file = NULL;
+const char *key_log_dir = NULL;
+
+static int
+server_load_cert (const char *cert_file, const char *key_file)
+{
+    int rv = -1;
+
+    s_ssl_ctx = SSL_CTX_new(TLS_method());
+    if (!s_ssl_ctx)
+    {
+        LOG("SSL_CTX_new failed");
+        goto end;
+    }
+    SSL_CTX_set_min_proto_version(s_ssl_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(s_ssl_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_default_verify_paths(s_ssl_ctx);
+    if (1 != SSL_CTX_use_certificate_chain_file(s_ssl_ctx, cert_file))
+    {
+        LOG("SSL_CTX_use_certificate_chain_file failed");
+        goto end;
+    }
+    if (1 != SSL_CTX_use_PrivateKey_file(s_ssl_ctx, key_file,
+                                                            SSL_FILETYPE_PEM))
+    {
+        LOG("SSL_CTX_use_PrivateKey_file failed");
+        goto end;
+    }
+    rv = 0;
+
+  end:
+    if (rv != 0)
+    {
+        if (s_ssl_ctx)
+            SSL_CTX_free(s_ssl_ctx);
+        s_ssl_ctx = NULL;
+    }
+    return rv;
+}
+
+
+static SSL_CTX *
+my_server_get_ssl_ctx (void *peer_ctx)
+{
+    return s_ssl_ctx;
+}
+
+// static void *
+// keylog_open (void *ctx, lsquic_conn_t *conn) {
+//     const char *const dir = ctx ? ctx : ".";
+//     const lsquic_cid_t *cid;
+//     FILE *fh;
+//     int sz;
+//     unsigned i;
+//     char id_str[MAX_CID_LEN * 2 + 1];
+//     char path[PATH_MAX];
+//     static const char b2c[16] = "0123456789ABCDEF";
+
+//     cid = lsquic_conn_id(conn);
+//     for (i = 0; i < cid->len; ++i)
+//     {
+//         id_str[i * 2 + 0] = b2c[ cid->idbuf[i] >> 4 ];
+//         id_str[i * 2 + 1] = b2c[ cid->idbuf[i] & 0xF ];
+//     }
+//     id_str[i * 2] = '\0';
+//     sz = snprintf(path, sizeof(path), "%s/%s.keys", dir, id_str);
+//     if ((size_t) sz >= sizeof(path))
+//     {
+//         LOG("WARN: %s: file too long", __func__);
+//         return NULL;
+//     }
+//     fh = fopen(path, "wb");
+//     if (!fh)
+//         LOG("WARN: could not open %s for writing: %s", path, strerror(errno));
+//     return fh;
+// }
+
+// static void
+// keylog_log_line (void *handle, const char *line) {
+//     fputs(line, handle);
+//     fputs("\n", handle);
+//     fflush(handle);
+// }
+
+// static void
+// keylog_close (void *handle) {
+//     fclose(handle);
+// }
+
+// static const struct lsquic_keylog_if *keylog_if =
+// {
+//     .kli_open       = keylog_open,
+//     .kli_log_line   = keylog_log_line,
+//     .kli_close      = keylog_close,
+// };
 
 int send_udp_data(struct sockaddr_in *target_addr, const char *data_buf, size_t buf_len) {
     int sockfd;
@@ -440,9 +538,18 @@ static void signal_handler(int signum) {
 
 void argument_parser(int argc, char** argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "l:p:v")) != -1) {
+    while ((opt = getopt(argc, argv, "c:k:G:l:p:f:v")) != -1) {
         switch(opt) {
             case 'p':
+                break;
+            case 'c':
+                cert_file = optarg;
+                break;
+            case 'k':
+                key_file = optarg;
+                break;
+            case 'G':
+                key_log_dir = optarg;
                 break;
             case 'l':
                 if (0 != lsquic_set_log_level(optarg)) {
@@ -515,11 +622,10 @@ void print_packet_hex(const uint8_t *packet_data, int num_bytes) {
     }
 }
 
-int read_socket(evutil_socket_t fd, short events, void *arg) {
+int read_socket(evutil_socket_t fd) {
     // struct server_ctx *server_ctx = (struct server_ctx*)arg;
-    lsquic_engine_t *engine = (lsquic_engine_t *)arg;
+    // lsquic_engine_t *engine = (lsquic_engine_t *)arg;
     ssize_t nread;
-    struct sockaddr_in local_sa = *(server_ctx.local_sa);
     struct sockaddr_storage peer_addr_storage;
     struct sockaddr *peer_sa = (struct sockaddr *)&peer_addr_storage;
     unsigned char *buf = malloc(4096);
@@ -527,7 +633,7 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
     unsigned char ctl_buf[1024];
 
     struct msghdr msg = {
-        .msg_name       = &peer_sa,
+        .msg_name       = peer_sa,
         .msg_namelen    = sizeof(peer_addr_storage),
         .msg_iov        = iov,
         .msg_iovlen     = 1,
@@ -545,10 +651,12 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
 
     if (nread == 0) return;
     if (s_verbose) print_packet_hex(buf, nread);
+    int ecn = 0;
+    // tut_proc_ancillary(&msg, &local_sas, &ecn);
     LOG("Providing packets to engine");
     lsquic_engine_packet_in(server_ctx.engine, buf, nread,
-        (struct sockaddr *) (server_ctx.local_sa),
-        peer_sa, NULL, 0);
+        (struct sockaddr *) &(server_ctx.local_sa),
+        peer_sa, NULL, ecn);
     
     int diff = 0;
     LOG("adv_tick");
@@ -560,8 +668,9 @@ int read_socket(evutil_socket_t fd, short events, void *arg) {
 }
 
 int main(int argc, char** argv) {
-    struct lsquic_engine_api engine_api;
-    struct lsquic_engine_settings settings;
+    const char *key_log_dir = NULL;
+    // struct lsquic_engine_api engine_api;
+    // struct lsquic_engine_settings settings;
     // struct server_ctx server_ctx;
     int sockfd;
 
@@ -569,6 +678,16 @@ int main(int argc, char** argv) {
     char errbuf[0x100];
 
     argument_parser(argc, argv);
+
+    if (!(cert_file && key_file)) {
+        LOG("Specify both cert (-c) and key (-k) files");
+        exit(EXIT_FAILURE);
+    }
+    
+    if (0 != server_load_cert(cert_file, key_file)) {
+        LOG("Cannot load certificate");
+        exit(EXIT_FAILURE);
+    }
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER)) {
         fprintf(stderr, "Global init failed\n");
@@ -579,11 +698,10 @@ int main(int argc, char** argv) {
     memset(&engine_api, 0, sizeof(engine_api));
     
     printf("hello\n");
-    lsquic_engine_init_settings(&settings, LSENG_HTTP);
+    lsquic_engine_init_settings(&settings, LSENG_SERVER);
     settings.es_ql_bits = 0;
 
-    if (0 != lsquic_engine_check_settings(&settings, LSENG_HTTP,
-    errbuf, sizeof(errbuf))) {
+    if (0 != lsquic_engine_check_settings(&settings, LSENG_SERVER, errbuf, sizeof(errbuf))) {
         LOG("invalid settings: %s", errbuf);
         exit(EXIT_FAILURE);
     }
@@ -594,21 +712,18 @@ int main(int argc, char** argv) {
     }
     server_ctx.sockfd = sockfd;
 
-    memset(&local_sa, 0, sizeof(local_sa));
-    local_sa.sin_family = AF_INET;
-    local_sa.sin_addr.s_addr = inet_addr("192.168.122.51");
-    local_sa.sin_port = 51813;
+    server_ctx.local_sa.sin_family = AF_INET;
+    server_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.51");
+    server_ctx.local_sa.sin_port = 51813;
 
-    socklen_t socklen = sizeof(local_sa);
-    if (0 != bind(sockfd, (struct sockaddr *)&local_sa, socklen))
+    if (0 != bind(sockfd, (struct sockaddr *)&(server_ctx.local_sa), sizeof(server_ctx.local_sa)))
     {
         perror("bind");
         exit(EXIT_FAILURE);
     }
 
-    getsockname(sockfd, (struct sockaddr *)&local_sa, &socklen);
-    fprintf(stderr, "bound to port:%d, sockfd:%d\n", local_sa.sin_port, sockfd);
-    server_ctx.local_sa = &local_sa;
+    getsockname(sockfd, (struct sockaddr *)&(server_ctx.local_sa), sizeof(server_ctx.local_sa));
+    fprintf(stderr, "bound to port:%d, sockfd:%d\n", server_ctx.local_sa.sin_port, sockfd);
 
     setvbuf(log_file, NULL, _IOLBF, 0);
     lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
@@ -616,19 +731,23 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    memset(&engine_api, 0, sizeof(engine_api));
     engine_api.ea_packets_out = send_packets_out;
     engine_api.ea_packets_out_ctx = &server_ctx;
     engine_api.ea_stream_if = &my_server_callbacks;
     engine_api.ea_stream_if_ctx = &server_ctx;
+    engine_api.ea_get_ssl_ctx   = my_server_get_ssl_ctx;
+    // if (key_log_dir)
+    // {
+    //     engine_api.ea_keylog_if = keylog_if;
+    //     engine_api.ea_keylog_ctx = (void *) key_log_dir;
+    // }
     engine_api.ea_settings = &settings;
 
-    lsquic_engine_t *engine = lsquic_engine_new(LSENG_SERVER|LSENG_HTTP, &engine_api);
-    if (!engine) {
+    server_ctx.engine = lsquic_engine_new(LSENG_SERVER|LSENG_HTTP, &engine_api);
+    if (!server_ctx.engine) {
         fprintf(stderr, "cannot create engine\n");
         exit(EXIT_FAILURE);
     }
-    server_ctx.engine = engine;
 
     struct event_base *base = event_base_new();
     if (!base) {
@@ -641,8 +760,8 @@ int main(int argc, char** argv) {
     event_add(socket_event, NULL);
     
     event_base_dispatch(base);
-
-    if(engine) lsquic_engine_destroy(engine);
+    // while (1) read_socket(server_ctx.sockfd);
+    if(server_ctx.engine) lsquic_engine_destroy(server_ctx.engine);
     lsquic_global_cleanup();
     return 0;
 }
