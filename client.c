@@ -117,6 +117,54 @@ client_set_nonblocking (int fd)
     return 0;
 }
 
+static SSL_CTX *s_ssl_ctx;
+const char *cert_file = NULL, *key_file = NULL;
+const char *key_log_dir = NULL;
+
+static int
+client_load_cert (const char *cert_file, const char *key_file)
+{
+    int rv = -1;
+
+    s_ssl_ctx = SSL_CTX_new(TLS_method());
+    if (!s_ssl_ctx)
+    {
+        LOG("SSL_CTX_new failed");
+        goto end;
+    }
+    SSL_CTX_set_min_proto_version(s_ssl_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(s_ssl_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_default_verify_paths(s_ssl_ctx);
+    if (1 != SSL_CTX_use_certificate_chain_file(s_ssl_ctx, cert_file))
+    {
+        LOG("SSL_CTX_use_certificate_chain_file failed");
+        goto end;
+    }
+    if (1 != SSL_CTX_use_PrivateKey_file(s_ssl_ctx, key_file,
+                                                            SSL_FILETYPE_PEM))
+    {
+        LOG("SSL_CTX_use_PrivateKey_file failed");
+        goto end;
+    }
+    rv = 0;
+
+  end:
+    if (rv != 0)
+    {
+        if (s_ssl_ctx)
+            SSL_CTX_free(s_ssl_ctx);
+        s_ssl_ctx = NULL;
+    }
+    return rv;
+}
+
+
+static SSL_CTX *
+my_client_get_ssl_ctx (void *peer_ctx)
+{
+    return s_ssl_ctx;
+}
+
 void print_packet_hex(const uint8_t *packet_data, int num_bytes) {
     fprintf(log_file, "Received Packet (%d bytes):\n", num_bytes);
     
@@ -441,7 +489,7 @@ cli_usage () {
 
 void argument_parser(int argc, char** argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "hl:vf:p:t:m:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:k:l:f:p:t:m:hv")) != -1) {
         switch(opt) {
             case 'm':
                 printf("%s\n", optarg);
@@ -478,6 +526,12 @@ void argument_parser(int argc, char** argv) {
                     exit(EXIT_FAILURE);
                 }
                 break;
+            case 'c':
+                cert_file = optarg;
+                break;
+            case 'k':
+                key_file = optarg;
+                break;
             case 'h':
                 cli_usage();
                 exit(EXIT_SUCCESS);
@@ -502,11 +556,16 @@ int main(int argc, char** argv) {
     struct lsquic_engine_api engine_api;
     struct lsquic_engine_settings settings;
     socklen_t socklen;
-    memset(&client_ctx, 0, sizeof(client_ctx));
 
     log_file = stderr;
     char errbuf[0x100];
 
+    if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
+        fprintf(stderr, "lsquic global initialisation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(&client_ctx, 0, sizeof(client_ctx));
     memset(&target_sa, 0, sizeof(target_sa));
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
@@ -537,14 +596,16 @@ int main(int argc, char** argv) {
     getsockname((client_ctx.sockfd), &(client_ctx.local_sa), &socklen);
     fprintf(stderr, "Socket bound to port %d and fd: %d\n", ntohs(client_ctx.local_sa.sin_port), client_ctx.sockfd);
 
-    if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
-        fprintf(stderr, "lsquic global initialisation failed");
-        exit(EXIT_FAILURE);
-    }
-
     argument_parser(argc, argv);
 
-    lsquic_engine_init_settings(&settings, 0);
+    if (!(cert_file && key_file)) {
+        if (0 != client_load_cert(cert_file, key_file)) {
+            LOG("Cannot load certificate");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    lsquic_engine_init_settings(&settings, LSENG_HTTP);
     // settings.es_ql_bits = 0;
 
     if (0 != lsquic_engine_check_settings(&settings, 0, errbuf, sizeof(errbuf))) {
@@ -562,9 +623,10 @@ int main(int argc, char** argv) {
 
     memset(&engine_api, 0, sizeof(engine_api));
     engine_api.ea_packets_out = client_packets_out;
-    engine_api.ea_packets_out_ctx = &client_ctx;
+    engine_api.ea_packets_out_ctx = (void *) &fd;
     engine_api.ea_stream_if = &my_client_callbacks;
     engine_api.ea_stream_if_ctx = &client_ctx;
+    engine_api.ea_get_ssl_ctx   = my_client_get_ssl_ctx;
     engine_api.ea_settings = &settings;
     // engine_api.ea_hsi_if = 1;
 

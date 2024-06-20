@@ -717,7 +717,7 @@ int main(int argc, char** argv) {
     memset(&engine_api, 0, sizeof(engine_api));
     
     printf("hello\n");
-    lsquic_engine_init_settings(&settings, LSENG_SERVER);
+    lsquic_engine_init_settings(&settings, LSENG_SERVER|LSENG_HTTP);
     settings.es_ql_bits = 0;
 
     if (0 != lsquic_engine_check_settings(&settings, LSENG_SERVER, errbuf, sizeof(errbuf))) {
@@ -735,6 +735,11 @@ int main(int argc, char** argv) {
     {
         perror("fcntl");
         exit(EXIT_FAILURE);
+    }
+
+    int on = 1;
+    if (0 != setsockopt(sockfd, IPPROTO_IP, IP_RECVORIGDSTADDR, &on, sizeof(on))) {
+        perror("setsockopt");
     }
 
     server_ctx.local_sa.sin_family = AF_INET;
