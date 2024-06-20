@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <fcntl.h> 
 
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -160,6 +161,21 @@ struct lsquic_stream_ctx {
 
 struct sockaddr_in client_sa;
 struct sockaddr_in target_sa;
+
+static int
+server_set_nonblocking (int fd)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL);
+    if (-1 == flags)
+        return -1;
+    flags |= O_NONBLOCK;
+    if (0 != fcntl(fd, F_SETFL, flags))
+        return -1;
+
+    return 0;
+}
 
 static SSL_CTX *s_ssl_ctx;
 const char *cert_file = NULL, *key_file = NULL;
@@ -644,9 +660,10 @@ int read_socket(evutil_socket_t fd) {
     nread = recvmsg(fd, &msg, 0);
     if (0 > nread) {
         LOG("got -1 from recvmsg");
-        if (!(EAGAIN == errno || EWOULDBLOCK == errno || ECONNRESET == errno))
+        if (!(EAGAIN == errno || EWOULDBLOCK == errno || ECONNRESET == errno)) {
             LOG("recvmsg: %s", strerror(errno));
-        return;
+            return;
+        }
     }
 
     if (nread == 0) return;
@@ -660,9 +677,11 @@ int read_socket(evutil_socket_t fd) {
     
     int diff = 0;
     LOG("adv_tick");
-    while (lsquic_engine_earliest_adv_tick(server_ctx.engine, &diff) <= 1) {
-        LOG("process_conn");
-        lsquic_engine_process_conns(server_ctx.engine);
+    while (lsquic_engine_earliest_adv_tick(server_ctx.engine, &diff) == 1) {
+        if (diff <= 0) {
+            LOG("process_conn");
+            lsquic_engine_process_conns(server_ctx.engine);
+        }
     }
     LOG("read_socket enf");
 }
@@ -711,6 +730,12 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
     server_ctx.sockfd = sockfd;
+
+    if (0 != server_set_nonblocking(sockfd))
+    {
+        perror("fcntl");
+        exit(EXIT_FAILURE);
+    }
 
     server_ctx.local_sa.sin_family = AF_INET;
     server_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.51");
