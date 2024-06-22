@@ -718,7 +718,7 @@ int main(int argc, char** argv) {
     
     printf("hello\n");
     lsquic_engine_init_settings(&settings, LSENG_SERVER|LSENG_HTTP);
-    settings.es_ql_bits = 0;
+    // settings.es_ql_bits = 0;
 
     if (0 != lsquic_engine_check_settings(&settings, LSENG_SERVER, errbuf, sizeof(errbuf))) {
         LOG("invalid settings: %s", errbuf);

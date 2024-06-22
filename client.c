@@ -34,7 +34,7 @@ struct lsquic_http_headers headers;
 
 struct proxy_client_ctx
 {
-    lsquic_engine_t *engine;
+    const lsquic_engine_t *engine;
     // char payload_sizep[20];
     int sockfd;
     struct sockaddr_in local_sa;
@@ -224,10 +224,10 @@ int read_socket(evutil_socket_t fd) {
     }
     int diff = 0;
     LOG("adv_tick");
-    if (lsquic_engine_earliest_adv_tick(engine, &diff) == 1) {
+    if (lsquic_engine_earliest_adv_tick(client_ctx.engine, &diff) == 1) {
         if (diff <= 0) {
             LOG("process_conn");
-            lsquic_engine_process_conns(engine);
+            lsquic_engine_process_conns(client_ctx.engine);
         }
     }
     LOG("read_socket end");
@@ -606,7 +606,7 @@ int main(int argc, char** argv) {
     }
 
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
-    // settings.es_ql_bits = 0;
+    settings.es_ql_bits = 0;
 
     if (0 != lsquic_engine_check_settings(&settings, 0, errbuf, sizeof(errbuf))) {
         LOG("invalid settings: %s", errbuf);
@@ -626,41 +626,40 @@ int main(int argc, char** argv) {
     engine_api.ea_packets_out_ctx = (void *) &fd;
     engine_api.ea_stream_if = &my_client_callbacks;
     engine_api.ea_stream_if_ctx = &client_ctx;
-    engine_api.ea_get_ssl_ctx   = my_client_get_ssl_ctx;
+    engine_api.ea_get_ssl_ctx = my_client_get_ssl_ctx;
     engine_api.ea_settings = &settings;
     // engine_api.ea_hsi_if = 1;
 
     LOG("Creating a new engine");
     engine = lsquic_engine_new(LSENG_HTTP, &engine_api);
-    if (!engine) {
+    client_ctx.engine = engine;
+    if (!client_ctx.engine) {
         LOG("cannot create engine\n");
         exit(EXIT_FAILURE);
     }
-    memcpy(&(client_ctx.engine), &engine, sizeof(engine));
-    if ((client_ctx.engine) != engine) {
-        printf("fuck this shit\n");
-        exit(EXIT_FAILURE);
-    }
+    printf("engine: %p", client_ctx.engine);
     
     struct lsquic_conn_ctx conn_ctx;
-    conn_ctx.client_ctx = &client_ctx;
-
+    
+    printf("engine: %p", client_ctx.engine);
     /*lsquic_conn_t *lsquic_engine_connect(lsquic_engine_t *engine, enum lsquic_
         version version, const struct sockaddr *local_sa, const struct sockaddr *peer_sa, 
         void *peer_ctx, lsquic_conn_ctx_t *conn_ctx, const char *sni, unsigned short base_plpmtu, 
         const unsigned char *sess_resume, size_t sess_resume_len, const unsigned char *token, 
         size_t token_sz) */
     LOG("Connecting to peer");
-    lsquic_conn_t *conn = lsquic_engine_connect(engine, N_LSQVER, &(client_ctx.local_sa), &proxy_sa, NULL,
+    lsquic_conn_t *conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &(client_ctx.local_sa), &proxy_sa, NULL,
                                     &conn_ctx, NULL, 0, NULL, 0, NULL, 0);
-    
+    printf("engine: %p", client_ctx.engine);
     conn_ctx.conn = conn;
+    conn_ctx.client_ctx = &client_ctx;
     if (!conn_ctx.conn)
     {
         LOG("cannot create connection");
         exit(EXIT_FAILURE);
     }
-    lsquic_engine_process_conns(engine);
+    printf("engine: %p", client_ctx.engine);
+    lsquic_engine_process_conns(client_ctx.engine);
     
     // struct event_base *base = event_base_new();
     // if (!base) {
