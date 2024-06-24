@@ -205,11 +205,8 @@ int read_socket(evutil_socket_t fd) {
         .msg_control    = ctl_buf,
         .msg_controllen = 1024,
     };
-    LOG("reading socket for packets");
     nread = recvmsg(fd, &msg, 0);
-    LOG("Received %ld bytes", nread);
     if (0 > nread) {
-        LOG("got -1 from recvmsg");
         if (!(EAGAIN == errno || EWOULDBLOCK == errno || ECONNRESET == errno)){
             LOG("recvmsg: %s", strerror(errno));
             return;
@@ -218,19 +215,17 @@ int read_socket(evutil_socket_t fd) {
     if (nread > 0) {
         if (s_verbose) print_packet_hex(buf, nread);
         LOG("Providing packets to engine");
-        (void) lsquic_engine_packet_in(client_ctx.engine, buf, nread,
+        (void) lsquic_engine_packet_in(engine, buf, nread,
             (struct sockaddr *) &(client_ctx.local_sa),
             peer_sa, (void*) &fd, 0);
     }
     int diff = 0;
-    LOG("adv_tick");
-    if (lsquic_engine_earliest_adv_tick(client_ctx.engine, &diff) == 1) {
+    if (lsquic_engine_earliest_adv_tick(engine, &diff) == 1) {
         if (diff <= 0) {
             LOG("process_conn");
-            lsquic_engine_process_conns(client_ctx.engine);
+            lsquic_engine_process_conns(engine);
         }
     }
-    LOG("read_socket end");
 }
 
 static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spec *specs, unsigned count) {
@@ -569,8 +564,11 @@ int main(int argc, char** argv) {
     memset(&target_sa, 0, sizeof(target_sa));
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
-    proxy_sa.sin_addr.s_addr = inet_addr("192.168.122.51");  /*www.proxy.com*/
+    proxy_sa.sin_addr.s_addr = inet_addr("192.168.200.194");  /*www.proxy.com*/
     proxy_sa.sin_port = 51813;
+    client_ctx.local_sa.sin_family = AF_INET;
+    client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.201.194");
+    client_ctx.local_sa.sin_port = 51813;
 
     int fd;
     if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -598,12 +596,13 @@ int main(int argc, char** argv) {
 
     argument_parser(argc, argv);
 
-    if (!(cert_file && key_file)) {
+    if ((cert_file && key_file)) {
         if (0 != client_load_cert(cert_file, key_file)) {
             LOG("Cannot load certificate");
             exit(EXIT_FAILURE);
         }
     }
+    else LOG("Certificate and key files not specified");
 
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
     settings.es_ql_bits = 0;
@@ -641,7 +640,6 @@ int main(int argc, char** argv) {
     
     struct lsquic_conn_ctx conn_ctx;
     
-    printf("engine: %p", client_ctx.engine);
     /*lsquic_conn_t *lsquic_engine_connect(lsquic_engine_t *engine, enum lsquic_
         version version, const struct sockaddr *local_sa, const struct sockaddr *peer_sa, 
         void *peer_ctx, lsquic_conn_ctx_t *conn_ctx, const char *sni, unsigned short base_plpmtu, 
@@ -650,7 +648,6 @@ int main(int argc, char** argv) {
     LOG("Connecting to peer");
     lsquic_conn_t *conn = lsquic_engine_connect(client_ctx.engine, N_LSQVER, &(client_ctx.local_sa), &proxy_sa, NULL,
                                     &conn_ctx, NULL, 0, NULL, 0, NULL, 0);
-    printf("engine: %p", client_ctx.engine);
     conn_ctx.conn = conn;
     conn_ctx.client_ctx = &client_ctx;
     if (!conn_ctx.conn)
@@ -658,8 +655,7 @@ int main(int argc, char** argv) {
         LOG("cannot create connection");
         exit(EXIT_FAILURE);
     }
-    printf("engine: %p", client_ctx.engine);
-    lsquic_engine_process_conns(client_ctx.engine);
+    lsquic_engine_process_conns(engine);
     
     // struct event_base *base = event_base_new();
     // if (!base) {

@@ -743,7 +743,7 @@ int main(int argc, char** argv) {
     }
 
     server_ctx.local_sa.sin_family = AF_INET;
-    server_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.51");
+    server_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.200.194");
     server_ctx.local_sa.sin_port = 51813;
 
     if (0 != bind(sockfd, (struct sockaddr *)&(server_ctx.local_sa), sizeof(server_ctx.local_sa)))
@@ -779,18 +779,19 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
-    struct event_base *base = event_base_new();
-    if (!base) {
-        perror("Couldn't create event_base");
-        exit(EXIT_FAILURE);
-    }
+    //struct event_base *base = event_base_new();
+    //if (!base) {
+    //    perror("Couldn't create event_base");
+    //    exit(EXIT_FAILURE);
+    //}
 
-    struct event *socket_event = event_new(
-        base, sockfd, EV_READ | EV_PERSIST, read_socket, (void*) &server_ctx);
-    event_add(socket_event, NULL);
+    //struct event *socket_event = event_new(
+    //    base, sockfd, EV_READ | EV_PERSIST, read_socket, (void*) &server_ctx);
+    //event_add(socket_event, NULL);
     
-    event_base_dispatch(base);
-    // while (1) read_socket(server_ctx.sockfd);
+    //event_base_dispatch(base);
+    while (1) read_socket(server_ctx.sockfd);
+
     if(server_ctx.engine) lsquic_engine_destroy(server_ctx.engine);
     lsquic_global_cleanup();
     return 0;
