@@ -12,8 +12,10 @@
   - `git submodule update --init --recursive`
 
 ## Build the project
-  - `cmake . && make`
+  - `mkdir build`
+  - `cd build`
+  - `cmake .. && make`
 
 ## Run example
-  - `./client -vl debug`
-  - `./udp_proxy`
+  - `./client -t 127.0.0.1 -p 192.168.255.255 -l debug`  /*only an example*/
+  - `./udp_proxy`-c mycert-cert.pem -k mycert-key.pem -l debug

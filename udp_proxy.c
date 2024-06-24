@@ -67,22 +67,25 @@ struct server_ctx
 {
     struct lsquic_conn_ctx  *conn_h;
     lsquic_engine_t *engine;
-    struct sockaddr_in local_sa;
+    struct sockaddr_storage local_sas;
     int sockfd;
     unsigned max_conn;
     unsigned n_conn;
     unsigned n_current_conns;
     unsigned delay_resp_sec;
-    char *method;
-    char *protocol;
-    char *scheme;
-    char * path;
-    char *authority;
+    struct event_base *server_eb;
+    struct event *ev;
+    struct event *server_timer;
+    //char *method;
+    //char *protocol;
+    //char *scheme;
+    //char * path;
+    //char *authority;
 };
 
 struct server_ctx server_ctx;
 struct lsquic_engine_api engine_api;
-    struct lsquic_engine_settings settings;
+struct lsquic_engine_settings settings;
 
 struct lsquic_conn_ctx
 {
@@ -122,7 +125,7 @@ struct req
     // char        *qif;
     // size_t       qif;
     struct lsxpack_header
-                 xhdr;
+	         xhdr;
     size_t       decode_off;
     char         decode_buf[MIN(LSXPACK_MAX_STRLEN + 1, 64 * 1024)];
 };
@@ -139,28 +142,13 @@ struct lsquic_stream_ctx {
         SH_HEADERS_READ = (1 << 2),
     }                    flags;
     struct lsquic_reader reader;
-    int                  file_fd;   /* Used by pwritev */
-
-    
     struct req          *req;
     const char          *resp_status;
-    // union {
-    //     struct index_html_ctx   ihc;
-    //     struct ver_head_ctx     vhc;
-    //     struct md5sum_ctx       md5c;
-    //     struct gen_file_ctx     gfc;
-        struct {
-            char buf[0x100];
-            struct resp resp;
-        }                       err;
-    // }                    interop_u;
-    struct event        *resume_resp;
-    size_t               written;
-    size_t               file_size; /* Used by pwritev */
 };
 
 struct sockaddr_in client_sa;
 struct sockaddr_in target_sa;
+struct sockaddr_in local_sa;
 
 static int
 server_set_nonblocking (int fd)
@@ -638,7 +626,24 @@ void print_packet_hex(const uint8_t *packet_data, int num_bytes) {
     }
 }
 
-int read_socket(evutil_socket_t fd) {
+void server_process_conns() {
+    int diff;
+    struct timeval timeout;
+    lsquic_engine_process_conns(server_ctx.engine);
+    if (lsquic_engine_earliest_adv_tick(server_ctx.engine, &diff)) {
+        if (diff < 0 || (unsigned) diff < engine_api.ea_settings->es_clock_granularity) {
+	    timeout.tv_sec = 0;
+	    timeout.tv_usec = engine_api.ea_settings->es_clock_granularity;
+	}
+	else {
+	    timeout.tv_sec = (unsigned) diff / 1000000;
+	    timeout.tv_usec = (unsigned) diff % 1000000;
+	}
+	event_add(server_ctx.server_timer, &timeout);
+    }
+}
+
+int read_socket(evutil_socket_t fd, short flags, void *arg) {
     // struct server_ctx *server_ctx = (struct server_ctx*)arg;
     // lsquic_engine_t *engine = (lsquic_engine_t *)arg;
     ssize_t nread;
@@ -666,28 +671,22 @@ int read_socket(evutil_socket_t fd) {
         }
     }
 
-    if (nread == 0) return;
     if (s_verbose) print_packet_hex(buf, nread);
     int ecn = 0;
     // tut_proc_ancillary(&msg, &local_sas, &ecn);
     LOG("Providing packets to engine");
     lsquic_engine_packet_in(server_ctx.engine, buf, nread,
-        (struct sockaddr *) &(server_ctx.local_sa),
+        (struct sockaddr *) &(server_ctx.local_sas),
         peer_sa, NULL, ecn);
-    
-    int diff = 0;
-    LOG("adv_tick");
-    while (lsquic_engine_earliest_adv_tick(server_ctx.engine, &diff) == 1) {
-        if (diff <= 0) {
-            LOG("process_conn");
-            lsquic_engine_process_conns(server_ctx.engine);
-        }
-    }
+    if (nread > 0) server_process_conns();
     LOG("read_socket enf");
 }
 
+static void server_timer_handler (int fd, short events, void *arg) {
+    server_process_conns();
+}
+
 int main(int argc, char** argv) {
-    const char *key_log_dir = NULL;
     // struct lsquic_engine_api engine_api;
     // struct lsquic_engine_settings settings;
     // struct server_ctx server_ctx;
@@ -716,44 +715,46 @@ int main(int argc, char** argv) {
     memset(&server_ctx, 0, sizeof(server_ctx));
     memset(&engine_api, 0, sizeof(engine_api));
     
-    printf("hello\n");
     lsquic_engine_init_settings(&settings, LSENG_SERVER|LSENG_HTTP);
     // settings.es_ql_bits = 0;
 
-    if (0 != lsquic_engine_check_settings(&settings, LSENG_SERVER, errbuf, sizeof(errbuf))) {
+    if (0 != lsquic_engine_check_settings(&settings, LSENG_SERVER|LSENG_HTTP, errbuf, sizeof(errbuf))) {
         LOG("invalid settings: %s", errbuf);
         exit(EXIT_FAILURE);
     }
 
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    if (((server_ctx.sockfd) = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
-    server_ctx.sockfd = sockfd;
+    sockfd = server_ctx.sockfd;
 
-    if (0 != server_set_nonblocking(sockfd))
+    if (0 != server_set_nonblocking((server_ctx.sockfd)))
     {
         perror("fcntl");
         exit(EXIT_FAILURE);
     }
 
     int on = 1;
-    if (0 != setsockopt(sockfd, IPPROTO_IP, IP_RECVORIGDSTADDR, &on, sizeof(on))) {
+    if (0 != setsockopt((server_ctx.sockfd), IPPROTO_IP, IP_RECVORIGDSTADDR, &on, sizeof(on))) {
         perror("setsockopt");
+	exit(EXIT_FAILURE);
     }
 
-    server_ctx.local_sa.sin_family = AF_INET;
-    server_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.200.194");
-    server_ctx.local_sa.sin_port = 51813;
+    struct sockaddr_in *const sa4 = (void *) &(server_ctx.local_sas);
 
-    if (0 != bind(sockfd, (struct sockaddr *)&(server_ctx.local_sa), sizeof(server_ctx.local_sa)))
+    sa4->sin_family = AF_INET;
+    sa4->sin_addr.s_addr = inet_addr("192.168.200.194");
+    sa4->sin_port = 51813;
+
+    if (0 != bind(sockfd, (struct sockaddr *)&(server_ctx.local_sas), sizeof((server_ctx.local_sas))))
     {
         perror("bind");
         exit(EXIT_FAILURE);
     }
 
-    getsockname(sockfd, (struct sockaddr *)&(server_ctx.local_sa), sizeof(server_ctx.local_sa));
-    fprintf(stderr, "bound to port:%d, sockfd:%d\n", server_ctx.local_sa.sin_port, sockfd);
+    getsockname((server_ctx.sockfd), (struct sockaddr *)&(local_sa), sizeof(local_sa));
+    fprintf(stderr, "bound to port:%d, sockfd:%d\n", local_sa.sin_port, sockfd);
 
     setvbuf(log_file, NULL, _IOLBF, 0);
     lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
@@ -766,6 +767,10 @@ int main(int argc, char** argv) {
     engine_api.ea_stream_if = &my_server_callbacks;
     engine_api.ea_stream_if_ctx = &server_ctx;
     engine_api.ea_get_ssl_ctx   = my_server_get_ssl_ctx;
+    /* TODO
+     * set ea_lookup_cert
+     * set ea_cert_lu_ctx */
+
     // if (key_log_dir)
     // {
     //     engine_api.ea_keylog_if = keylog_if;
@@ -773,11 +778,19 @@ int main(int argc, char** argv) {
     // }
     engine_api.ea_settings = &settings;
 
+    server_ctx.server_eb = event_base_new();
+
     server_ctx.engine = lsquic_engine_new(LSENG_SERVER|LSENG_HTTP, &engine_api);
     if (!server_ctx.engine) {
         fprintf(stderr, "cannot create engine\n");
         exit(EXIT_FAILURE);
     }
+
+   server_ctx.server_timer = event_new(server_ctx.server_eb, -1, 0, server_timer_handler, NULL);
+   server_ctx.ev = event_new(server_ctx.server_eb, server_ctx.sockfd, EV_READ|EV_PERSIST, read_socket, NULL);
+   if (server_ctx.ev) event_add(server_ctx.ev, NULL);
+
+   event_base_loop(server_ctx.server_eb, 0);
 
     //struct event_base *base = event_base_new();
     //if (!base) {
@@ -790,9 +803,9 @@ int main(int argc, char** argv) {
     //event_add(socket_event, NULL);
     
     //event_base_dispatch(base);
-    while (1) read_socket(server_ctx.sockfd);
 
     if(server_ctx.engine) lsquic_engine_destroy(server_ctx.engine);
+    event_base_free(server_ctx.server_eb);
     lsquic_global_cleanup();
     return 0;
 }
