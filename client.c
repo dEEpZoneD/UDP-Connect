@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -22,6 +23,9 @@
 
 #include "lsquic.h"
 #include "lsxpack_header.h"
+#include "../src/liblsquic/lsquic_logger.h"
+#include "../src/liblsquic/lsquic_int_types.h"
+#include "../src/liblsquic/lsquic_util.h"
 
 #define HTTP_PORT 443
 #define TARGET_PORT 8888
@@ -29,6 +33,7 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 static FILE *log_file;
+int s_discard_response = 0;
 
 struct lsquic_http_headers headers;
 
@@ -69,22 +74,248 @@ struct lsquic_conn_ctx {
 };
 
 
-struct hset_elem
+struct hset
 {
     size_t                      nalloc;
     struct lsxpack_header       xhdr;
 };
 
+static int s_display_cert_chain;
+
 static void
-hset_dump (const struct hset *, FILE *);
+hset_dump (const struct hset *, FILE *) {
+    const struct hset *el;
+
+    
+    if (el->xhdr.flags & (LSXPACK_HPACK_VAL_MATCHED|LSXPACK_QPACK_IDX))
+        fprintf(stderr, "%.*s (%s static table idx %u): %.*s\n",
+            (int) el->xhdr.name_len, lsxpack_header_get_name(&el->xhdr),
+            el->xhdr.flags & LSXPACK_HPACK_VAL_MATCHED ? "hpack" : "qpack",
+            el->xhdr.flags & LSXPACK_HPACK_VAL_MATCHED ? el->xhdr.hpack_index
+                                                : el->xhdr.qpack_index,
+            (int) el->xhdr.val_len, lsxpack_header_get_value(&el->xhdr));
+    else
+        fprintf(stderr, "%.*s: %.*s\n",
+            (int) el->xhdr.name_len, lsxpack_header_get_name(&el->xhdr),
+            (int) el->xhdr.val_len, lsxpack_header_get_value(&el->xhdr));
+
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static void *
+hset_create (void *hsi_ctx, lsquic_stream_t *stream, int is_push_promise)
+{
+    struct hset *hset;
+
+    if (s_discard_response)
+        return (void *) 1;
+    else if ((hset = malloc(sizeof(*hset))))
+    {
+        return hset;
+    }
+    else
+        return NULL;
+}
+
+static struct lsxpack_header *
+hset_prepare_decode (void *hset_p, struct lsxpack_header *xhdr,
+                                                        size_t req_space)
+{
+    struct hset *const hset = hset_p;
+    struct hset *el;
+    char *buf;
+
+    if (0 == req_space)
+        req_space = 0x100;
+
+    if (req_space > LSXPACK_MAX_STRLEN)
+    {
+        LSQ_WARN("requested space for header is too large: %zd bytes",
+                                                                    req_space);
+        return NULL;
+    }
+
+    if (!xhdr)
+    {
+        buf = malloc(req_space);
+        if (!buf)
+        {
+            LSQ_WARN("cannot allocate buf of %zd bytes", req_space);
+            return NULL;
+        }
+        el = malloc(sizeof(*el));
+        if (!el)
+        {
+            LSQ_WARN("cannot allocate hset");
+            free(buf);
+            return NULL;
+        }
+        memcpy(el, hset, sizeof(*el));
+        lsxpack_header_prepare_decode(&el->xhdr, buf, 0, req_space);
+        el->nalloc = req_space;
+    }
+    else
+    {
+        el = (struct hset *) ((char *) xhdr
+                                        - offsetof(struct hset, xhdr));
+        if (req_space <= el->nalloc)
+        {
+            LSQ_ERROR("requested space is smaller than already allocated");
+            return NULL;
+        }
+        if (req_space < el->nalloc * 2)
+            req_space = el->nalloc * 2;
+        buf = realloc(el->xhdr.buf, req_space);
+        if (!buf)
+        {
+            LSQ_WARN("cannot reallocate hset buf");
+            return NULL;
+        }
+        el->xhdr.buf = buf;
+        el->xhdr.val_len = req_space;
+        el->nalloc = req_space;
+    }
+
+    return &el->xhdr;
+}
+
+
+static int
+hset_add_header (void *hset_p, struct lsxpack_header *xhdr)
+{
+    unsigned name_len, value_len;
+    /* Not much to do: the header value are in xhdr */
+
+    if (xhdr)
+    {
+        name_len = xhdr->name_len;
+        value_len = xhdr->val_len;   /* ": \r\n" */
+    }
+
+
+    return 0;
+}
+
 static void
-hset_destroy (void *hset);
+hset_destroy (void *hset_p) {
+    struct hset *el = hset_p;
+
+    if (!s_discard_response)
+    {
+            
+        free(el->xhdr.buf);
+        free(el);
+    }
+}
+
+static const struct lsquic_hset_if header_bypass_api =
+{
+    .hsi_create_header_set  = hset_create,
+    .hsi_prepare_decode     = hset_prepare_decode,
+    .hsi_process_header     = hset_add_header,
+    .hsi_discard_header_set = hset_destroy,
+};
+
 static void
-display_cert_chain (lsquic_conn_t *);
+display_cert_chain (lsquic_conn_t *) {
+    STACK_OF(X509) *chain;
+    X509_NAME *name;
+    X509 *cert;
+    unsigned i;
+    char buf[100];
+
+    chain = lsquic_conn_get_server_cert_chain(conn);
+    if (!chain)
+    {
+        LSQ_WARN("could not get server certificate chain");
+        return;
+    }
+
+    for (i = 0; i < sk_X509_num(chain); ++i)
+    {
+        cert = sk_X509_value(chain, i);
+        name = X509_get_subject_name(cert);
+        LSQ_INFO("cert #%u: name: %s", i,
+                            X509_NAME_oneline(name, buf, sizeof(buf)));
+        X509_free(cert);
+    }
+
+    sk_X509_free(chain);
+}
+
+struct reader_ctx
+{
+    size_t  file_size;
+    size_t  nread;
+    int     fd;
+};
+
+
+size_t
+test_reader_size (void *void_ctx)
+{
+    struct reader_ctx *const ctx = void_ctx;
+    return ctx->file_size - ctx->nread;
+}
+
+
+size_t
+test_reader_read (void *void_ctx, void *buf, size_t count)
+{
+    struct reader_ctx *const ctx = void_ctx;
+    ssize_t nread;
+
+    if (count > test_reader_size(ctx))
+        count = test_reader_size(ctx);
+
+    nread = read(ctx->fd, buf, count);
+
+    if (nread >= 0)
+    {
+        ctx->nread += nread;
+        return nread;
+    }
+    else
+    {
+        LSQ_WARN("%s: error reading from file: %s", __func__, strerror(errno));
+        ctx->nread = ctx->file_size = 0;
+        return 0;
+    }
+}
+
+
+struct reader_ctx *
+create_lsquic_reader_ctx (const char *filename)
+{
+    int fd;
+    struct stat st;
+
+
+    fd = open(filename, O_RDONLY);
+    if (fd < 0)
+    {
+        LSQ_ERROR("cannot open %s for reading: %s", filename, strerror(errno));
+        return NULL;
+    }
+
+    if (0 != fstat(fd, &st))
+    {
+        LSQ_ERROR("cannot fstat(%s) failed: %s", filename, strerror(errno));
+        (void) close(fd);
+        return NULL;
+    }
+    struct reader_ctx *ctx = malloc(sizeof(*ctx));
+    ctx->file_size = st.st_size;
+    ctx->nread = 0;
+    ctx->fd = fd;
+    return ctx;
+}
 
 struct lsquic_stream_ctx {
     lsquic_stream_t     *stream;
     struct proxy_client_ctx   *client_ctx;
+    const char *path;
     enum {
         HEADERS_SENT    = (1 << 0),
         PROCESSED_HEADERS = 1 << 1,
@@ -96,8 +327,9 @@ struct lsquic_stream_ctx {
     size_t               sh_nread;  /* Number of bytes read from stream using one of
                                      * lsquic_stream_read* functions.
                                      */
+    lsquic_time_t        sh_created;
+    lsquic_time_t        sh_ttfb;
     unsigned             count;
-    FILE                *download_fh;
     struct lsquic_reader reader;
 };
 
@@ -268,15 +500,14 @@ int read_socket(evutil_socket_t fd) {
 }
 
 static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spec *specs, unsigned count) {
-    struct proxy_client_ctx *client_ctx = packets_out_ctx;
+    struct proxy_client_ctx *packets_out = packets_out_ctx;
     unsigned n;
     int fd, s = 0;
     struct msghdr msg;
 
     if (0 == count) 
         return 0;
-
-    fd = 3;
+    fd = client_ctx.sockfd;
     n = 0;
     LOG("sockfd = %d", fd);
     msg.msg_flags      = 0;
@@ -314,13 +545,20 @@ static int client_packets_out(void *packets_out_ctx, const struct lsquic_out_spe
 }
 
 static lsquic_conn_ctx_t *my_client_on_new_conn(void *stream_if_ctx, struct lsquic_conn *conn) {
-    // struct proxy_client_ctx *client_ctc = stream_if_ctx;
-    LOG("NEWW CONN");
-    lsquic_conn_ctx_t *conn_h = stream_if_ctx;
+    struct proxy_client_ctx *stream_if = stream_if_ctx;
+    LOG("NEW CONN");
+    lsquic_conn_ctx_t *conn_h = calloc(1, sizeof(*conn_h));
     conn_h->conn = conn;
-    lsquic_conn_make_stream(conn);
     conn_h->client_ctx = stream_if_ctx;
+    lsquic_conn_make_stream(conn);
     return conn_h;
+}
+
+static void my_client_on_conn_closed (struct lsquic_conn *conn) {
+    lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
+    lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
+    free(conn_h);
+    LOG("Connection closed");
 }
 
 static void my_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status) {
@@ -332,13 +570,6 @@ static void my_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status s
                     status == LSQ_HSK_RESUMED_OK ? "(session resumed)" : "");
     }
     else LOG("Handshake failed");
-}
-
-static void my_client_on_conn_closed (struct lsquic_conn *conn) {
-    lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
-    lsquic_conn_set_ctx(conn, NULL);
-    // free(conn_h);
-    LOG("Connection closed");
 }
 
 static lsquic_stream_ctx_t *my_client_on_new_stream (void *stream_if_ctx, struct lsquic_stream *stream) {
@@ -353,6 +584,18 @@ static lsquic_stream_ctx_t *my_client_on_new_stream (void *stream_if_ctx, struct
     lsquic_stream_ctx_t *st_h = calloc(1, sizeof(*st_h));
     st_h->stream = stream;
     st_h->client_ctx = stream_if_ctx;
+    st_h->sh_created = lsquic_time_now();
+    st_h->path = st_h->client_ctx->path;
+    if (st_h->client_ctx->payload)
+    {
+        st_h->reader.lsqr_read = test_reader_read;
+        st_h->reader.lsqr_size = test_reader_size;
+        st_h->reader.lsqr_ctx = create_lsquic_reader_ctx(st_h->client_ctx->payload);
+        if (!st_h->reader.lsqr_ctx)
+            exit(1);
+    }
+    else
+        st_h->reader.lsqr_ctx = NULL;
     LOG("created new stream, we want to write");
     lsquic_stream_wantwrite(stream, 1);
     return st_h;
@@ -376,7 +619,7 @@ static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t
     }
     else {
         LOG("error reading from stream (%s) -- exit loop");
-        exit((EXIT_FAILURE));
+        event_base_loopbreak(client_ctx.client_eb);
     }
 }
 
@@ -405,66 +648,63 @@ client_set_header (struct lsxpack_header *hdr, struct header_buf *header_buf,
         return -1;
 }
 
-static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
-    lsquic_conn_t *conn;
-    struct proxy_client_ctx *client_ctx;
-    lsquic_stream_ctx_t *st_f = h;
-    struct header_buf hbuf;
-    struct lsxpack_header harray[5];
-    struct lsquic_http_headers headers = { 6, harray, };
+static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
+    ssize_t nw;
 
-    hbuf.off = 0;
-#define V(v) (v), strlen(v)
-    client_set_header(&harray[0], &hbuf, V(":method"), V("CONNECT"));
-    client_set_header(&harray[1], &hbuf, V(":protocol"), V("connect-udp"));
-    client_set_header(&harray[2], &hbuf, V(":scheme"), V("https"));
-    client_set_header(&harray[3], &hbuf, V(":path"), V("/udp/192.168.122.252/8888"));
-    client_set_header(&harray[4], &hbuf, V(":authority"),
-                                              V("142.250.191.78:443"));
-    client_set_header(&harray[5], &hbuf, V("user-agent"), V("h3cli/lsquic"));
-
-    if (0 == lsquic_stream_send_headers(stream, &headers, 0))
-    {
-        lsquic_stream_shutdown(stream, 1);
-        lsquic_stream_wantread(stream, 1);
+    if (st_h->sh_flags & HEADERS_SENT) {
+        nw = lsquic_stream_writef(stream, &st_h->reader);
+            if (nw < 0)
+            {
+                LSQ_ERROR("write error: %s", strerror(errno));
+                exit(1);
+            }
+            if (test_reader_size(st_h->reader.lsqr_ctx) > 0)
+            {
+                lsquic_stream_wantwrite(stream, 1);
+            }
+            else
+            {
+                lsquic_stream_shutdown(stream, 1);
+                lsquic_stream_wantread(stream, 1);
+            }
+        }
+        else
+        {
+            lsquic_stream_shutdown(stream, 1);
+            lsquic_stream_wantread(stream, 1);
+        }
     }
-    else
-    {
-        LOG("ERROR: lsquic_stream_send_headers failed: %s", strerror(errno));
-        lsquic_conn_abort(lsquic_stream_conn(stream));
+    else {
+        struct header_buf hbuf;
+        struct lsxpack_header harray[5];
+        struct lsquic_http_headers headers = { 6, harray, };
+
+        hbuf.off = 0;
+    #define V(v) (v), strlen(v)
+        client_set_header(&harray[0], &hbuf, V(":method"), V(client_ctx.method));
+        client_set_header(&harray[1], &hbuf, V(":protocol"), V(client_ctx.protocol));
+        client_set_header(&harray[2], &hbuf, V(":scheme"), V(client_ctx.scheme));
+        client_set_header(&harray[3], &hbuf, V(":path"), V(client_ctx.path));
+        client_set_header(&harray[4], &hbuf, V(":authority"),
+                                                V(client_ctx.authority));
+        client_set_header(&harray[5], &hbuf, V("user-agent"), V("h3cli/lsquic"));
+        client_set_header(&harray[6], &hbuf, V("content-type"), V("application/octet-stream"));
+        client_set_header(&harray[7], &hbuf, V("content-length"), V(st_h->client_ctx->payload_size));
+
+        lsquic_http_headers_t headers = {
+            .count = sizeof(harray) / sizeof(harray[0]),
+            .headers = harray,
+        };
+        if (!st_h->client_ctx->payload)
+            headers.count -= 2;
+        if (0 != lsquic_stream_send_headers(st_h->stream, &headers,
+                                        st_h->client_ctx->payload == NULL))
+        {
+            LSQ_ERROR("cannot send headers: %s", strerror(errno));
+            exit(1);
+        }
+        st_h->sh_flags |= HEADERS_SENT;
     }
-    // ssize_t nw;
-    // conn = lsquic_stream_conn(stream);
-    // struct lsquic_conn_ctx *conn_ctx = lsquic_conn_get_ctx(conn);
-
-    // nw = lsquic_stream_write(stream, client_ctx->buf, client_ctx->sz);
-
-    // if (nw > 0)
-    // {
-    //     client_ctx->sz -= (size_t) nw;
-    //     if (client_ctx->sz == 0)
-    //     {
-    //         LOG("wrote all %zd bytes to stream, switch to reading",
-    //                                                         (size_t) nw);
-    //         lsquic_stream_shutdown(stream, 1);  /* This flushes as well */
-    //         lsquic_stream_wantread(stream, 1);
-    //     }
-    //     else
-    //     {
-    //         memmove(client_ctx->buf, client_ctx->buf + nw, client_ctx->sz);
-    //         LOG("wrote %zd bytes to stream, still have %zd bytes to write",
-    //                                             (size_t) nw, client_ctx->sz);
-    //     }
-    // }
-    // else
-    // {
-    //     /* When `on_write()' is called, the library guarantees that at least
-    //      * something can be written.  If not, that's an error whether 0 or -1
-    //      * is returned.
-    //      */
-    //     LOG("stream_write() returned %ld, abort connection", (long) nw);
-    //     lsquic_conn_abort(lsquic_stream_conn(stream));
-    // }
 }
 
 static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
@@ -655,6 +895,8 @@ int main(int argc, char** argv) {
     engine_api.ea_packets_out_ctx = (void *) &client_ctx;
     engine_api.ea_stream_if = &my_client_callbacks;
     engine_api.ea_stream_if_ctx = &client_ctx;
+    engine_api.ea_hsi_if = &header_bypass_api;
+    engine_api.ea_hsi_ctx = NULL;
     // engine_api.ea_get_ssl_ctx = my_client_get_ssl_ctx;
     engine_api.ea_settings = &settings;
     // engine_api.ea_hsi_if = 1;
