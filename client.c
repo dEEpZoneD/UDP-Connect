@@ -42,21 +42,46 @@ struct proxy_client_ctx
     struct lsquic_conn *conn;
     size_t              sz;         /* Size of bytes read is stored here */
     char                buf[0x100]; /* Read up to this many bytes */
+    const char *hostname;
     const char *method;
     const char *path;
     const char *protocol;
     const char *scheme;
     const char *authority;
     const char *payload;
+    char payload_size[20];
+    struct event_base client_eb;
+    struct event client_timer;
+    struct event ev;
+
+    const char *qif_file;
+    FILE *qif_fh;
 };
 
 struct proxy_client_ctx client_ctx;
 lsquic_engine_t *engine;
+struct lsquic_engine_api engine_api;
+struct lsquic_engine_settings settings;
 
 struct lsquic_conn_ctx {
     lsquic_conn_t *conn;
     struct proxy_client_ctx *client_ctx;
 };
+
+
+struct hset_elem
+{
+    struct hset_elem            stqe;
+    size_t                      nalloc;
+    struct lsxpack_header       xhdr;
+};
+
+static void
+hset_dump (const struct hset *, FILE *);
+static void
+hset_destroy (void *hset);
+static void
+display_cert_chain (lsquic_conn_t *);
 
 struct lsquic_stream_ctx {
     lsquic_stream_t     *stream;
@@ -187,6 +212,27 @@ void print_packet_hex(const uint8_t *packet_data, int num_bytes) {
     }
 }
 
+void client_process_conns() {
+    int diff;
+    struct timeval timeout;
+    lsquic_engine_process_conns(server_ctx.engine);
+    if (lsquic_engine_earliest_adv_tick(server_ctx.engine, &diff)) {
+        if (diff < 0 || (unsigned) diff < engine_api.ea_settings->es_clock_granularity) {
+	    timeout.tv_sec = 0;
+	    timeout.tv_usec = engine_api.ea_settings->es_clock_granularity;
+	}
+	else {
+	    timeout.tv_sec = (unsigned) diff / 1000000;
+	    timeout.tv_usec = (unsigned) diff % 1000000;
+	}
+	event_add(server_ctx.server_timer, &timeout);
+    }
+}
+
+static void client_timer_handler (int fd, short events, void *arg) {
+    client_process_conns();
+}
+
 int read_socket(evutil_socket_t fd) {
     // struct proxy_client_ctx *client_ctx = (struct proxy_client_ctx*)arg;
     // lsquic_engine_t *engine = (lsquic_engine_t *)arg;
@@ -218,13 +264,7 @@ int read_socket(evutil_socket_t fd) {
         (void) lsquic_engine_packet_in(engine, buf, nread,
             (struct sockaddr *) &(client_ctx.local_sa),
             peer_sa, (void*) &fd, 0);
-    }
-    int diff = 0;
-    if (lsquic_engine_earliest_adv_tick(engine, &diff) == 1) {
-        if (diff <= 0) {
-            LOG("process_conn");
-            lsquic_engine_process_conns(engine);
-        }
+        client_process_conns();
     }
 }
 
@@ -507,13 +547,7 @@ void argument_parser(int argc, char** argv) {
                 }
                 break;
             case 'p':
-                if (inet_pton(AF_INET, optarg, &proxy_sa.sin_addr) != 1) {
-                    fprintf(stderr, "Invalid proxy server IP address <%s>\n", optarg);
-                    exit(EXIT_FAILURE);
-                }
-                // char ip_str[INET_ADDRSTRLEN];
-                // inet_ntop(AF_INET, &proxy_addr.addr4, ip_str, INET_ADDRSTRLEN);
-                // printf("%s\n", ip_str);
+                client_ctx.path = optarg;
                 break;
             case 't':
                 if (inet_pton(AF_INET, optarg, &target_sa.sin_addr) != 1) {
@@ -548,19 +582,15 @@ static void signal_handler(int signum) {
 }
 
 int main(int argc, char** argv) {
-    struct lsquic_engine_api engine_api;
-    struct lsquic_engine_settings settings;
     socklen_t socklen;
+    const char *token = NULL;
 
     log_file = stderr;
     char errbuf[0x100];
 
-    if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
-        fprintf(stderr, "lsquic global initialisation failed");
-        exit(EXIT_FAILURE);
-    }
-
     memset(&client_ctx, 0, sizeof(client_ctx));
+    memset(&engine_api, 0, sizeof(engine_api));
+
     memset(&target_sa, 0, sizeof(target_sa));
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
@@ -596,21 +626,22 @@ int main(int argc, char** argv) {
 
     argument_parser(argc, argv);
 
-    if ((cert_file && key_file)) {
-        if (0 != client_load_cert(cert_file, key_file)) {
-            LOG("Cannot load certificate");
-            exit(EXIT_FAILURE);
-        }
-    }
-    else LOG("Certificate and key files not specified");
+    client_ctx.method = "CONNECT";
+    client_ctx.protocol = "connect-udp";
+    client_ctx.scheme = "https";
+    client_ctx.authority = "example.org";
+
+    // if ((cert_file && key_file)) {
+    //     if (0 != client_load_cert(cert_file, key_file)) {
+    //         LOG("Cannot load certificate");
+    //         exit(EXIT_FAILURE);
+    //     }
+    // }
+    // else LOG("Certificate and key files not specified");
 
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
-    settings.es_ql_bits = 0;
-
-    if (0 != lsquic_engine_check_settings(&settings, 0, errbuf, sizeof(errbuf))) {
-        LOG("invalid settings: %s", errbuf);
-        exit(EXIT_FAILURE);
-    }
+    // settings.es_ql_bits = 0;
+    settings.es_ua = "lsquic" "/" "2" "." "18" "." "1";
 
     setvbuf(log_file, NULL, _IOLBF, 0);
     lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
@@ -622,12 +653,29 @@ int main(int argc, char** argv) {
 
     memset(&engine_api, 0, sizeof(engine_api));
     engine_api.ea_packets_out = client_packets_out;
-    engine_api.ea_packets_out_ctx = (void *) &fd;
+    engine_api.ea_packets_out_ctx = (void *) &client_ctx;
     engine_api.ea_stream_if = &my_client_callbacks;
     engine_api.ea_stream_if_ctx = &client_ctx;
-    engine_api.ea_get_ssl_ctx = my_client_get_ssl_ctx;
+    // engine_api.ea_get_ssl_ctx = my_client_get_ssl_ctx;
     engine_api.ea_settings = &settings;
     // engine_api.ea_hsi_if = 1;
+
+    if (0 != lsquic_global_init(LSQUIC_GLOBAL_CLIENT)) {
+        fprintf(stderr, "lsquic global initialisation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (!client_ctx.path) {
+        fprintf(stderr, "specify atleast one path using the -p option\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (0 != lsquic_engine_check_settings(&settings, 0, errbuf, sizeof(errbuf))) {
+        LOG("invalid settings: %s", errbuf);
+        exit(EXIT_FAILURE);
+    }
+
+    client_ctx.client_eb = event_base_new();
 
     LOG("Creating a new engine");
     engine = lsquic_engine_new(LSENG_HTTP, &engine_api);
@@ -639,6 +687,17 @@ int main(int argc, char** argv) {
     printf("engine: %p", client_ctx.engine);
     
     struct lsquic_conn_ctx conn_ctx;
+
+    client_ctx.client_timer = event_new(client_ctx.client_eb, -1, 0, client_timer_handler, NULL);
+
+   if (0 != connect(sockfd, sa_peer, peer_socklen)) {
+        close(sockfd);
+        perror("connect");
+        exit(EXIT_FAILURE);
+    }
+
+    client_ctx.ev = event_new(client_ctx.server_eb, client_ctx.sockfd, EV_READ|EV_PERSIST, read_socket, NULL);
+   if (client_ctx.ev) event_add(client_ctx.ev, NULL);
     
     /*lsquic_conn_t *lsquic_engine_connect(lsquic_engine_t *engine, enum lsquic_
         version version, const struct sockaddr *local_sa, const struct sockaddr *peer_sa, 
@@ -657,24 +716,7 @@ int main(int argc, char** argv) {
     }
     lsquic_engine_process_conns(engine);
     
-    // struct event_base *base = event_base_new();
-    // if (!base) {
-    //     perror("Couldn't create event_base");
-    //     return 1;
-    // }
-
-    // // Create event for the socket with a timeout of 30 seconds
-    // struct event *socket_event = event_new(
-    //     base, client_ctx.sockfd, EV_READ | EV_PERSIST, read_socket, &client_ctx);
-    // event_add(socket_event, NULL);
-
-    // Event loop that keeps the program running until connection succeeds/fails
-    
-    // event_base_dispatch(base);
-
-
-    // LOG("engine_process_conns called");
-    while (1) read_socket(fd);
+    event_base_loop(client_ctx.client_eb, 0);
     
     if (conn_ctx.conn) {
         LOG("Closing connection");
