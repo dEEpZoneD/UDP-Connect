@@ -762,7 +762,7 @@ cli_usage () {
 
 void argument_parser(int argc, char** argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "c:k:l:f:p:t:m:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "c:k:l:f:p:t:m:P:hv")) != -1) {
         switch(opt) {
             case 'm':
                 printf("%s\n", optarg);
@@ -787,6 +787,9 @@ void argument_parser(int argc, char** argv) {
             case 'p':
                 client_ctx.path = optarg;
                 break;
+	    case 'P':
+		client_ctx.payload = optarg;
+		break;
             case 't':
                 if (inet_pton(AF_INET, optarg, &target_sa.sin_addr) != 1) {
                     fprintf(stderr, "Invalid target server IP address <%s>\n", optarg);
