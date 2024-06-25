@@ -83,24 +83,24 @@ struct hset
 static int s_display_cert_chain;
 
 static void
-hset_dump (const struct hset *, FILE *) {
+hset_dump (const struct hset *hset, FILE *out) {
     const struct hset *el;
 
     
     if (el->xhdr.flags & (LSXPACK_HPACK_VAL_MATCHED|LSXPACK_QPACK_IDX))
-        fprintf(stderr, "%.*s (%s static table idx %u): %.*s\n",
+        fprintf(out, "%.*s (%s static table idx %u): %.*s\n",
             (int) el->xhdr.name_len, lsxpack_header_get_name(&el->xhdr),
             el->xhdr.flags & LSXPACK_HPACK_VAL_MATCHED ? "hpack" : "qpack",
             el->xhdr.flags & LSXPACK_HPACK_VAL_MATCHED ? el->xhdr.hpack_index
                                                 : el->xhdr.qpack_index,
             (int) el->xhdr.val_len, lsxpack_header_get_value(&el->xhdr));
     else
-        fprintf(stderr, "%.*s: %.*s\n",
+        fprintf(out, "%.*s: %.*s\n",
             (int) el->xhdr.name_len, lsxpack_header_get_name(&el->xhdr),
             (int) el->xhdr.val_len, lsxpack_header_get_value(&el->xhdr));
 
-    fprintf(stderr, "\n");
-    fflush(stderr);
+    fprintf(out, "\n");
+    fflush(out);
 }
 
 static void *
@@ -218,7 +218,7 @@ static const struct lsquic_hset_if header_bypass_api =
 };
 
 static void
-display_cert_chain (lsquic_conn_t *) {
+display_cert_chain (lsquic_conn_t *conn) {
     STACK_OF(X509) *chain;
     X509_NAME *name;
     X509 *cert;
@@ -556,7 +556,6 @@ static lsquic_conn_ctx_t *my_client_on_new_conn(void *stream_if_ctx, struct lsqu
 
 static void my_client_on_conn_closed (struct lsquic_conn *conn) {
     lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
-    lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
     free(conn_h);
     LOG("Connection closed");
 }
@@ -652,7 +651,8 @@ static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_
     ssize_t nw;
 
     if (st_h->sh_flags & HEADERS_SENT) {
-        nw = lsquic_stream_writef(stream, &st_h->reader);
+        if (st_h->client_ctx->payload && test_reader_size(st_h->reader.lsqr_ctx) > 0) {    
+	    nw = lsquic_stream_writef(stream, &st_h->reader);
             if (nw < 0)
             {
                 LSQ_ERROR("write error: %s", strerror(errno));
@@ -677,10 +677,9 @@ static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_
     else {
         struct header_buf hbuf;
         struct lsxpack_header harray[5];
-        struct lsquic_http_headers headers = { 6, harray, };
 
         hbuf.off = 0;
-    #define V(v) (v), strlen(v)
+#define V(v) (v), strlen(v)
         client_set_header(&harray[0], &hbuf, V(":method"), V(client_ctx.method));
         client_set_header(&harray[1], &hbuf, V(":protocol"), V(client_ctx.protocol));
         client_set_header(&harray[2], &hbuf, V(":scheme"), V(client_ctx.scheme));
