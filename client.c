@@ -50,9 +50,9 @@ struct proxy_client_ctx
     const char *authority;
     const char *payload;
     char payload_size[20];
-    struct event_base client_eb;
-    struct event client_timer;
-    struct event ev;
+    struct event_base *client_eb;
+    struct event *client_timer;
+    struct event *ev;
 
     const char *qif_file;
     FILE *qif_fh;
@@ -71,7 +71,6 @@ struct lsquic_conn_ctx {
 
 struct hset_elem
 {
-    struct hset_elem            stqe;
     size_t                      nalloc;
     struct lsxpack_header       xhdr;
 };
@@ -215,8 +214,8 @@ void print_packet_hex(const uint8_t *packet_data, int num_bytes) {
 void client_process_conns() {
     int diff;
     struct timeval timeout;
-    lsquic_engine_process_conns(server_ctx.engine);
-    if (lsquic_engine_earliest_adv_tick(server_ctx.engine, &diff)) {
+    lsquic_engine_process_conns(engine);
+    if (lsquic_engine_earliest_adv_tick(engine, &diff)) {
         if (diff < 0 || (unsigned) diff < engine_api.ea_settings->es_clock_granularity) {
 	    timeout.tv_sec = 0;
 	    timeout.tv_usec = engine_api.ea_settings->es_clock_granularity;
@@ -225,7 +224,7 @@ void client_process_conns() {
 	    timeout.tv_sec = (unsigned) diff / 1000000;
 	    timeout.tv_usec = (unsigned) diff % 1000000;
 	}
-	event_add(server_ctx.server_timer, &timeout);
+	event_add(client_ctx.client_timer, &timeout);
     }
 }
 
@@ -690,13 +689,13 @@ int main(int argc, char** argv) {
 
     client_ctx.client_timer = event_new(client_ctx.client_eb, -1, 0, client_timer_handler, NULL);
 
-   if (0 != connect(sockfd, sa_peer, peer_socklen)) {
-        close(sockfd);
+   if (0 != connect(fd,(struct sockaddr *) &proxy_sa, sizeof(proxy_sa))) {
+        close(fd);
         perror("connect");
         exit(EXIT_FAILURE);
     }
 
-    client_ctx.ev = event_new(client_ctx.server_eb, client_ctx.sockfd, EV_READ|EV_PERSIST, read_socket, NULL);
+    client_ctx.ev = event_new(client_ctx.client_eb, client_ctx.sockfd, EV_READ|EV_PERSIST, read_socket, NULL);
    if (client_ctx.ev) event_add(client_ctx.ev, NULL);
     
     /*lsquic_conn_t *lsquic_engine_connect(lsquic_engine_t *engine, enum lsquic_

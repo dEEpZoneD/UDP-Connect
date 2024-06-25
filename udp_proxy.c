@@ -346,6 +346,7 @@ static lsquic_stream_ctx_t *server_on_new_stream (void *stream_if_ctx, struct ls
     }
     st_h->stream = stream;
     st_h->server_ctx = stream_if_ctx;
+    // lsquic_conn_push_stream(stream);
     lsquic_stream_wantread(stream, 1);
     return st_h;
 }
