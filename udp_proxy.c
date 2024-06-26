@@ -351,75 +351,104 @@ static lsquic_stream_ctx_t *server_on_new_stream (void *stream_if_ctx, struct ls
     return st_h;
 }
 
-static int parse_request(struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
-    int found_method = 0, found_protocol = 0, found_scheme = 0, found_path = 0, found_authority = 0;
-    char *line, *key, *value;
-    line = strtok(st_h->buf, "\r\n");
-    while (line != NULL) {
-        // Split the header line into key and value
-        key = strtok(line, ": ");
-        value = strtok(NULL, "\r\n");
+static int parse_request(lsquic_stream_ctx_t *st_h) {
+#define PATH_PREFIX "/udp/"
+#define PATH_DELIMITER "/"
+    char *path = st_h->req->path;
+    char ip[INET_ADDRSTRLEN];
+    char port_str[6];
+    int port;
 
-        if (key && value) {
-            // Check for required headers
-            if (strcasecmp(key, ":method") == 0 && !found_method) {
-                strncpy(st_h->req->method, value, sizeof(st_h->req->method) - 1);
-                found_method = 1;
-            } else if (strcasecmp(key, ":protocol") == 0 && !found_protocol) {
-                strncpy(st_h->req->protocol, value, sizeof(st_h->req->protocol) - 1);
-                found_protocol = 1;
-            } else if (strcasecmp(key, ":scheme") == 0 && !found_scheme) {
-                strncpy(st_h->req->scheme, value, sizeof(st_h->req->scheme) - 1);
-                found_scheme = 1;
-            } else if (strcasecmp(key, ":path") == 0 && !found_path) {
-                strncpy(st_h->req->path, value, sizeof(st_h->req->path) - 1);
-                found_path = 1;
-            } else if (strcasecmp(key, ":authority") == 0 && !found_authority) {
-                strncpy(st_h->req->authority, value, sizeof(st_h->req->authority) - 1);
-                found_authority = 1;
-            }
-            // Add parsing logic for other headers as needed
-        }
-
-        line = strtok(NULL, "\r\n"); // Get the next line
+    if (strncmp(path, PATH_PREFIX, strlen(PATH_PREFIX)) != 0) {
+        fprintf(stderr, "Error: Invalid path prefix\n");
+        return -1; // Error
     }
 
-    if (found_method && found_protocol && found_scheme && found_path && found_authority) {
-        // All required headers found
-        return 0; // Success
+    path += strlen(PATH_PREFIX);
+
+    char *ip_end = strchr(path, PATH_DELIMITER);
+    if (!ip_end || (ip_end - path) >= INET_ADDRSTRLEN) {
+        fprintf(stderr, "Error: Invalid IP address in path\n");
+        return -1;
+    }
+    strncpy(ip, path, ip_end - path);
+    ip[ip_end - path] = '\0'; 
+
+    path = ip_end + 1;
+    char *port_end = strchr(path, PATH_DELIMITER);
+    if (!port_end || (port_end - path) >= sizeof(port_str)) {
+        fprintf(stderr, "Error: Invalid port in path\n");
+        return -1;
+    }
+    strncpy(port_str, path, port_end - path);
+    port_str[port_end - path] = '\0';
+    port = atoi(port_str);
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "Error: Invalid port number\n");
+        return -1;
     }
 
-    
-    // Reached end of headers without finding all required headers, or error occurred
-    return -1; // Error
+    memset(&target_sa, 0, sizeof(target_sa));
+    target_sa.sin_family = AF_INET;
+    target_sa.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &(target_sa.sin_addr)) != 1) {
+        perror("inet_pton");
+        return -1;
+    }
+
+    return 0;
 }
 
-// static int process_request(struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
-//     if (st_h->req->protocol == "connect-udp") {
-//         send_udp_data();
-//     }
-// }
-
-static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
-    struct lsquic_stream_ctx *st_h = h;
-    ssize_t nread;
-    unsigned char buf[1024];
-
-    nread = lsquic_stream_read(stream, buf, sizeof(buf));
-    if (nread > 0) {
-        st_h->buf = &buf[0];
-        st_h->sz++;
+static int process_request(lsquic_stream_ctx_t *st_h) {
+    if (st_h->req->protocol == "connect-udp") {
+        if (0 != send_udp_data(&target_sa, st_h->buf, st_h->sz)) {
+            return 0;
+        }
     }
-    else if (nread == 0) {
-        LOG("got request: `%.*s'", (int) st_h->sz, st_h->buf);
-        // parse_request(stream, st_h);
-        // process_request(stream, st_h);
-        // free(st_h->buf);
-        lsquic_stream_shutdown(stream, 0);
+    return -1;
+}
+
+static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
+    ssize_t nread;
+    unsigned char buf[0x400];
+
+    if (!(st_h->flags & SH_HEADERS_READ)) {
+        st_h->flags |= SH_HEADERS_READ;
+        st_h->req = lsquic_stream_get_hset(stream);
+        if (!st_h->req)
+            ERROR_RESP(500, "Internal error: cannot fetch header set from stream");
+        else if (!st_h->req->method == "CONNECT")
+            ERROR_RESP(501, "Method is not supported");
+        else if (!st_h->req->path)
+            ERROR_RESP(400, "Path is not specified");
+        // else if (!(map = find_handler(st_h->req->method, st_h->req->path, matches)))
+        //     ERROR_RESP(404, "No handler found for method: %s; path: %s",
+                // st_h->req->method, st_h->req->path);
+        else
+        {
+            /*TODO: Implement this*/
+            if (0 != parse_request(st_h)) {
+                LSQ_ERROR("failed to parse request");
+            }
+        }
     }
     else {
-        LOG("error reading: %s", strerror(errno));
-        lsquic_stream_close(stream);
+        nread = lsquic_stream_read(stream, buf, sizeof(buf));
+        if (nread > 0) {
+            st_h->buf = buf;
+            st_h->sz += nread;
+        }
+        else if (nread == 0) {
+            LOG("got request: `%.*s'", (int) st_h->sz, st_h->buf);
+            /*TODO: send payload*/
+            process_request(st_h);
+            free(st_h->buf);
+            lsquic_stream_shutdown(stream, 0);
+        }
+        else {
+            LOG("error reading: %s", strerror(errno));
+            lsquic_stream_close(stream);
+        }
     }
 }
 

@@ -600,26 +600,64 @@ static lsquic_stream_ctx_t *my_client_on_new_stream (void *stream_if_ctx, struct
     return st_h;
 }
 
-static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+static size_t
+discard (void *ctx, const unsigned char *buf, size_t sz, int fin)
+{
+    return sz;
+}
+
+static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
+    struct http_client_ctx *const read_ctx = st_h->client_ctx;
+    struct hset *hset;
     ssize_t nread;
+    unsigned nreads = 0;
     unsigned char buf[0x1000];
 
-    nread = lsquic_stream_readf(stream, buf, sizeof(buf));
-    if (nread > 0)
+    do
     {
-        fwrite(buf, 1, nread, stdout);
-        fflush(stdout);
-    }
-    else if (nread == 0)
-    {
-        LOG("read to end-of-stream: close connection");
-        lsquic_stream_shutdown(stream, 0);
-        lsquic_conn_close( lsquic_stream_conn(stream) );
-    }
-    else {
-        LOG("error reading from stream (%s) -- exit loop");
-        event_base_loopbreak(client_ctx.client_eb);
-    }
+        if (!(st_h->sh_flags & PROCESSED_HEADERS)) {
+            hset = lsquic_stream_get_hset(stream);
+            if (!hset)
+            {
+                LSQ_ERROR("could not get header set from stream");
+                exit(2);
+            }
+            if (s_discard_response)
+                LSQ_DEBUG("discard response: do not dump headers");
+            else
+                hset_dump(hset, stdout);
+            hset_destroy(hset);
+            st_h->sh_flags |= PROCESSED_HEADERS;
+        }
+        else if (nread = (s_discard_response
+                            ? lsquic_stream_readf(stream, discard, NULL)
+                            : lsquic_stream_read(stream, buf, sizeof(buf))),
+                    nread > 0)
+        {
+            fwrite(buf, 1, nread, stdout);
+            fflush(stdout);
+            if (!(st_h->sh_flags & PROCESSED_HEADERS))
+            {
+                /* First read is assumed to be the first byte */
+                st_h->sh_ttfb = lsquic_time_now();
+                update_sample_stats(&s_stat_ttfb,
+                                    st_h->sh_ttfb - st_h->sh_created);
+                st_h->sh_flags |= PROCESSED_HEADERS;
+            }
+            if (!s_discard_response)
+                fwrite(buf, 1, nread, stdout);
+        }
+        else if (0 == nread) {
+            lsquic_stream_shutdown(stream, 0);
+            break;
+        }
+        else
+        {
+            LSQ_ERROR("could not read: %s", strerror(errno));
+            exit(2);
+        }
+    } while (settings.es_rw_once
+            && nreads++ < 3);
 }
 
 struct header_buf
@@ -706,7 +744,10 @@ static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_
     }
 }
 
-static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h) {
+static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
+    if (st_h->reader.lsqr_ctx)
+        destroy_lsquic_reader_ctx(st_h->reader.lsqr_ctx);
+    free(st_h);
     LOG("stream closed");
 }
 
@@ -721,23 +762,6 @@ static struct lsquic_stream_if my_client_callbacks =
     .on_close           = my_client_on_close,
 };
 
-// union {
-//     struct sockaddr     sa;
-//     struct sockaddr_in  addr4;
-//     struct sockaddr_in6 addr6;
-// } proxy_addr;
-
-// union {
-//     struct sockaddr     sa;
-//     struct sockaddr_in  addr4;
-//     struct sockaddr_in6 addr6;
-// } local_addr;
-
-// union {
-//     struct sockaddr     sa;
-//     struct sockaddr_in  addr4;
-//     struct sockaddr_in6 addr6;
-// } target_addr;
 struct sockaddr_in proxy_sa;
 struct sockaddr_in target_sa;
 
@@ -746,17 +770,12 @@ cli_usage () {
     fprintf(stdout,
 "Usage:./client [options]\n"
 "\n"
-"   -t ip_addr      Set target server's IPv4 address\n"
-"   -p ip_addr      Set proxy server's IPv4 address\n"
+"   -p path         Set path (eg. /udp/192.168.255.255/443)\n"
 "   -f log_file     Set external file for logs\n"
 "   -l level        Set library-wide log level.  Defaults to 'warning'.\n"
 "                   Acceptable values are debug, info, notice, warning, error, alert, emerg, crit\n"
 "   -v              Verbose: log program messages as well.\n"
-// "   -M METHOD       Method.  GET by default.\n"
-// "   -o opt=val      Set lsquic engine setting to some value, overriding the\n"
-// "                     defaults.  For example,\n"
-// "                           -o version=ff00001c -o cc_algo=2\n"
-// "   -G DIR          Log TLS secrets to a file in directory DIR.\n"
+"   -P file         Payload file\n"
 "   -h              Print this help screen and exit.\n");
 }
 
