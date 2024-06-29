@@ -640,8 +640,6 @@ static void my_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t
             {
                 /* First read is assumed to be the first byte */
                 st_h->sh_ttfb = lsquic_time_now();
-                update_sample_stats(&s_stat_ttfb,
-                                    st_h->sh_ttfb - st_h->sh_created);
                 st_h->sh_flags |= PROCESSED_HEADERS;
             }
             if (!s_discard_response)
@@ -745,8 +743,8 @@ static void my_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_
 }
 
 static void my_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h) {
-    if (st_h->reader.lsqr_ctx)
-        destroy_lsquic_reader_ctx(st_h->reader.lsqr_ctx);
+    //if (st_h->reader.lsqr_ctx)
+    //    destroy_lsquic_reader_ctx(st_h->reader.lsqr_ctx);
     free(st_h);
     LOG("stream closed");
 }
@@ -854,11 +852,11 @@ int main(int argc, char** argv) {
     memset(&target_sa, 0, sizeof(target_sa));
     memset(&proxy_sa, 0, sizeof(proxy_sa));
     proxy_sa.sin_family = AF_INET;
-    proxy_sa.sin_addr.s_addr = inet_addr("192.168.200.194");  /*www.proxy.com*/
-    proxy_sa.sin_port = 51813;
+    proxy_sa.sin_addr.s_addr = inet_addr("192.168.122.51");  /*www.proxy.com*/
+    proxy_sa.sin_port = htons(443);
     client_ctx.local_sa.sin_family = AF_INET;
-    client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.201.194");
-    client_ctx.local_sa.sin_port = 51813;
+    client_ctx.local_sa.sin_addr.s_addr = inet_addr("192.168.122.35");
+    client_ctx.local_sa.sin_port = htons(443);
 
     int fd;
     if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -885,7 +883,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Socket bound to port %d and fd: %d\n", ntohs(client_ctx.local_sa.sin_port), client_ctx.sockfd);
 
     argument_parser(argc, argv);
-
+//shbsjcbsuy
     client_ctx.method = "CONNECT";
     client_ctx.protocol = "connect-udp";
     client_ctx.scheme = "https";
@@ -901,7 +899,7 @@ int main(int argc, char** argv) {
 
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
     // settings.es_ql_bits = 0;
-    settings.es_ua = "lsquic" "/" "2" "." "18" "." "1";
+    //settings.es_versions = 0xff00001d;
 
     setvbuf(log_file, NULL, _IOLBF, 0);
     lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
@@ -916,6 +914,7 @@ int main(int argc, char** argv) {
     engine_api.ea_packets_out_ctx = (void *) &client_ctx;
     engine_api.ea_stream_if = &my_client_callbacks;
     engine_api.ea_stream_if_ctx = &client_ctx;
+    engine_api.ea_alpn = "h3";
     engine_api.ea_hsi_if = &header_bypass_api;
     engine_api.ea_hsi_ctx = NULL;
     // engine_api.ea_get_ssl_ctx = my_client_get_ssl_ctx;

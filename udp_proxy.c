@@ -11,7 +11,8 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <fcntl.h> 
+#include <fcntl.h>
+#include <sys/queue.h>
 
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -19,22 +20,13 @@
 #include <openssl/err.h>
 
 #include "lsquic.h"
-// #include "../src/liblsquic/lsquic_hash.h"
 #include "../src/liblsquic/lsquic_logger.h"
+#include "../src/liblsquic/lsquic_hash.h"
 #include "../src/liblsquic/lsquic_int_types.h"
 #include "../src/liblsquic/lsquic_util.h"
 #include "lsxpack_header.h"
-// #include "test_config.h"
-// #include "test_common.h"
-// #include "test_cert.h"
-// #include "prog.h"
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-
-#define PORT 4443
-#define BUF_SIZE 1024
-
-static ssize_t s_pwritev;
 
 static FILE *log_file;
 
@@ -76,11 +68,6 @@ struct server_ctx
     struct event_base *server_eb;
     struct event *ev;
     struct event *server_timer;
-    //char *method;
-    //char *protocol;
-    //char *scheme;
-    //char * path;
-    //char *authority;
 };
 
 struct server_ctx server_ctx;
@@ -106,9 +93,9 @@ struct resp
 
 struct req
 {
-    // enum method {
-    //     UNSET, GET, POST, UNSUPPORTED,
-    // }            method;
+    enum method {
+        UNSET, GET, POST, CONNECT, UNSUPPORTED,
+    }            method_e;
     enum {
         HAVE_XHDR   = 1 << 0,
     }            flags;
@@ -146,7 +133,6 @@ struct lsquic_stream_ctx {
     const char          *resp_status;
 };
 
-struct sockaddr_in client_sa;
 struct sockaddr_in target_sa;
 struct sockaddr_in local_sa;
 
@@ -165,53 +151,205 @@ server_set_nonblocking (int fd)
     return 0;
 }
 
-static SSL_CTX *s_ssl_ctx;
-const char *cert_file = NULL, *key_file = NULL;
-const char *key_log_dir = NULL;
+struct ssl_ctx_st *s_ssl_ctx;
+struct lsquic_hash *prog_certs;
+
+struct server_cert
+{
+    char                *ce_sni;
+    struct ssl_ctx_st   *ce_ssl_ctx;
+    struct lsquic_hash_elem ce_hash_el;
+};
+
+static char s_alpn[0x100];
 
 static int
-server_load_cert (const char *cert_file, const char *key_file)
+select_alpn (SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                    const unsigned char *in, unsigned int inlen, void *arg)
+{
+    int r;
+
+    r = SSL_select_next_proto((unsigned char **) out, outlen, in, inlen,
+                                    (unsigned char *) s_alpn, strlen(s_alpn));
+    if (r == OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_OK;
+    else
+    {
+        LSQ_WARN("no supported protocol can be selected from %.*s",
+                                                    (int) inlen, (char *) in);
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+}
+
+int
+load_cert (struct lsquic_hash *certs, const char *optarg)
 {
     int rv = -1;
+    char *sni, *cert_file, *key_file;
+    struct server_cert *cert = NULL;
+    EVP_PKEY *pkey = NULL;
+    FILE *f = NULL;
 
-    s_ssl_ctx = SSL_CTX_new(TLS_method());
-    if (!s_ssl_ctx)
+    sni = strdup(optarg);
+    cert_file = strchr(sni, ',');
+    if (!cert_file)
+        goto end;
+    *cert_file = '\0';
+    ++cert_file;
+    key_file = strchr(cert_file, ',');
+    if (!key_file)
+        goto end;
+    *key_file = '\0';
+    ++key_file;
+
+    cert = calloc(1, sizeof(*cert));
+    cert->ce_sni = strdup(sni);
+
+    cert->ce_ssl_ctx = SSL_CTX_new(TLS_method());
+    if (!cert->ce_ssl_ctx)
     {
-        LOG("SSL_CTX_new failed");
+        LSQ_ERROR("SSL_CTX_new failed");
         goto end;
     }
-    SSL_CTX_set_min_proto_version(s_ssl_ctx, TLS1_3_VERSION);
-    SSL_CTX_set_max_proto_version(s_ssl_ctx, TLS1_3_VERSION);
-    SSL_CTX_set_default_verify_paths(s_ssl_ctx);
-    if (1 != SSL_CTX_use_certificate_chain_file(s_ssl_ctx, cert_file))
+    SSL_CTX_set_min_proto_version(cert->ce_ssl_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(cert->ce_ssl_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_default_verify_paths(cert->ce_ssl_ctx);
+    SSL_CTX_set_alpn_select_cb(cert->ce_ssl_ctx, select_alpn, NULL);
     {
-        LOG("SSL_CTX_use_certificate_chain_file failed");
+        const char *const s = getenv("LSQUIC_ENABLE_EARLY_DATA");
+        if (!s || atoi(s))
+            SSL_CTX_set_early_data_enabled(cert->ce_ssl_ctx, 1);    /* XXX */
+    }
+    if (1 != SSL_CTX_use_certificate_chain_file(cert->ce_ssl_ctx, cert_file))
+    {
+        LSQ_ERROR("SSL_CTX_use_certificate_chain_file failed: %s", cert_file);
         goto end;
     }
-    if (1 != SSL_CTX_use_PrivateKey_file(s_ssl_ctx, key_file,
+
+    if (strstr(key_file, ".pkcs8"))
+    {
+        f = fopen(key_file, "r");
+        if (!f)
+        {
+            LSQ_ERROR("fopen(%s) failed: %s", cert_file, strerror(errno));
+            goto end;
+        }
+        pkey = d2i_PrivateKey_fp(f, NULL);
+        fclose(f);
+        f = NULL;
+        if (!pkey)
+        {
+            LSQ_ERROR("Reading private key from %s failed", key_file);
+            goto end;
+        }
+        if (!SSL_CTX_use_PrivateKey(cert->ce_ssl_ctx, pkey))
+        {
+            LSQ_ERROR("SSL_CTX_use_PrivateKey failed");
+            goto end;
+        }
+    }
+    else if (1 != SSL_CTX_use_PrivateKey_file(cert->ce_ssl_ctx, key_file,
                                                             SSL_FILETYPE_PEM))
     {
-        LOG("SSL_CTX_use_PrivateKey_file failed");
+        LSQ_ERROR("SSL_CTX_use_PrivateKey_file failed");
         goto end;
     }
-    rv = 0;
+
+    const int was = SSL_CTX_set_session_cache_mode(cert->ce_ssl_ctx, 1);
+    LSQ_DEBUG("set SSL session cache mode to 1 (was: %d)", was);
+
+    if (lsquic_hash_insert(certs, cert->ce_sni, strlen(cert->ce_sni), cert,
+                                                            &cert->ce_hash_el))
+        rv = 0;
+    else
+        LSQ_WARN("cannot insert cert for %s into hash table", cert->ce_sni);
 
   end:
+    free(sni);
     if (rv != 0)
-    {
-        if (s_ssl_ctx)
-            SSL_CTX_free(s_ssl_ctx);
-        s_ssl_ctx = NULL;
+    {   /* Error: free cert and its components */
+        if (cert)
+        {
+            free(cert->ce_sni);
+            free(cert);
+        }
     }
     return rv;
 }
 
-
-static SSL_CTX *
-my_server_get_ssl_ctx (void *peer_ctx)
+struct ssl_ctx_st *
+lookup_cert (void *cert_lu_ctx, const struct sockaddr *sa_UNUSED,
+             const char *sni)
 {
-    return s_ssl_ctx;
+    struct lsquic_hash_elem *el;
+    struct server_cert *server_cert;
+
+    if (!cert_lu_ctx)
+        return NULL;
+
+    if (sni)
+        el = lsquic_hash_find(cert_lu_ctx, sni, strlen(sni));
+    else
+    {
+        LSQ_INFO("SNI is not set");
+        el = lsquic_hash_first(cert_lu_ctx);
+    }
+
+    if (el)
+    {
+        server_cert = lsquic_hashelem_getdata(el);
+        if (server_cert)
+            return server_cert->ce_ssl_ctx;
+    }
+
+    return NULL;
 }
+// const char *cert_file = NULL, *key_file = NULL;
+// const char *key_log_dir = NULL;
+
+// static int
+// server_load_cert (const char *cert_file, const char *key_file)
+// {
+//     int rv = -1;
+
+//     s_ssl_ctx = SSL_CTX_new(TLS_method());
+//     if (!s_ssl_ctx)
+//     {
+//         LOG("SSL_CTX_new failed");
+//         goto end;
+//     }
+//     SSL_CTX_set_min_proto_version(s_ssl_ctx, TLS1_3_VERSION);
+//     SSL_CTX_set_max_proto_version(s_ssl_ctx, TLS1_3_VERSION);
+//     SSL_CTX_set_default_verify_paths(s_ssl_ctx);
+//     if (1 != SSL_CTX_use_certificate_chain_file(s_ssl_ctx, cert_file))
+//     {
+//         LOG("SSL_CTX_use_certificate_chain_file failed");
+//         goto end;
+//     }
+//     if (1 != SSL_CTX_use_PrivateKey_file(s_ssl_ctx, key_file,
+//                                                             SSL_FILETYPE_PEM))
+//     {
+//         LOG("SSL_CTX_use_PrivateKey_file failed");
+//         goto end;
+//     }
+//     rv = 0;
+
+//   end:
+//     if (rv != 0)
+//     {
+//         if (s_ssl_ctx)
+//             SSL_CTX_free(s_ssl_ctx);
+//         s_ssl_ctx = NULL;
+//     }
+//     return rv;
+// }
+
+
+// static SSL_CTX *
+// my_server_get_ssl_ctx (void *peer_ctx)
+// {
+//     return s_ssl_ctx;
+// }
 
 // static void *
 // keylog_open (void *ctx, lsquic_conn_t *conn) {
@@ -416,11 +554,11 @@ static void server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *s
         st_h->flags |= SH_HEADERS_READ;
         st_h->req = lsquic_stream_get_hset(stream);
         if (!st_h->req)
-            ERROR_RESP(500, "Internal error: cannot fetch header set from stream");
+            LOG("Internal error: cannot fetch header set from stream");
         else if (!st_h->req->method == "CONNECT")
-            ERROR_RESP(501, "Method is not supported");
+            LOG("Method is not supported");
         else if (!st_h->req->path)
-            ERROR_RESP(400, "Path is not specified");
+            LOG("Path is not specified");
         // else if (!(map = find_handler(st_h->req->method, st_h->req->path, matches)))
         //     ERROR_RESP(404, "No handler found for method: %s; path: %s",
                 // st_h->req->method, st_h->req->path);
@@ -577,14 +715,19 @@ void argument_parser(int argc, char** argv) {
             case 'p':
                 break;
             case 'c':
-                cert_file = optarg;
+                prog_certs = lsquic_hash_create();
+                if (0 != load_cert(prog_certs, optarg)) {
+                    LOG("Connot load certificate");
+                    exit(EXIT_FAILURE);
+                }
+            //     cert_file = optarg;
+            //     break;
+            // case 'k':
+            //     key_file = optarg;
                 break;
-            case 'k':
-                key_file = optarg;
-                break;
-            case 'G':
-                key_log_dir = optarg;
-                break;
+            // case 'G':
+            //     key_log_dir = optarg;
+            //     break;
             case 'l':
                 if (0 != lsquic_set_log_level(optarg)) {
                     fprintf(stderr, "error processing log-level: %s\n", optarg);
@@ -716,10 +859,117 @@ static void server_timer_handler (int fd, short events, void *arg) {
     server_process_conns();
 }
 
+static void *
+interop_server_hset_create (void *hsi_ctx, lsquic_stream_t *stream,
+                            int is_push_promise)
+{
+    struct req *req;
+
+    req = malloc(sizeof(struct req));
+    memset(req, 0, offsetof(struct req, decode_buf));
+
+    return req;
+}
+
+
+static struct lsxpack_header *
+interop_server_hset_prepare_decode (void *hset_p, struct lsxpack_header *xhdr,
+                                                                size_t req_space)
+{
+    struct req *req = hset_p;
+
+    if (xhdr)
+    {
+        LSQ_WARN("we don't reallocate headers: can't give more");
+        return NULL;
+    }
+
+    if (req->flags & HAVE_XHDR)
+    {
+        if (req->decode_off + lsxpack_header_get_dec_size(&req->xhdr)
+                                                    >= sizeof(req->decode_buf))
+        {
+            LSQ_WARN("Not enough room in header");
+            return NULL;
+        }
+        req->decode_off += lsxpack_header_get_dec_size(&req->xhdr);
+    }
+    else
+        req->flags |= HAVE_XHDR;
+
+    lsxpack_header_prepare_decode(&req->xhdr, req->decode_buf,
+                req->decode_off, sizeof(req->decode_buf) - req->decode_off);
+    return &req->xhdr;
+}
+
+
+static int
+interop_server_hset_add_header (void *hset_p, struct lsxpack_header *xhdr)
+{
+    struct req *req = hset_p;
+    const char *name, *value;
+    unsigned name_len, value_len;
+
+    if (!xhdr)
+        return 0;
+
+    name = lsxpack_header_get_name(xhdr);
+    value = lsxpack_header_get_value(xhdr);
+    name_len = xhdr->name_len;
+    value_len = xhdr->val_len;
+
+    if (5 == name_len && 0 == strncmp(name, ":path", 5))
+    {
+        if (req->path)
+            return 1;
+        req->path = strndup(value, value_len);
+        if (!req->path)
+            return -1;
+        return 0;
+    }
+
+    if (7 == name_len && 0 == strncmp(name, ":method", 7))
+    {
+        req->method = strndup(value, value_len);
+        if (!req->method)
+            return -1;
+        return 0;
+    }
+
+
+
+    if (10 == name_len && 0 == strncmp(name, ":authority", 10))
+    {
+        req->authority = strndup(value, value_len);
+        if (!req->authority)
+            return -1;
+        return 0;
+    }
+
+    return 0;
+}
+
+
+static void
+interop_server_hset_destroy (void *hset_p)
+{
+    struct req *req = hset_p;
+    free(req->path);
+    free(req->method);
+    free(req->authority);
+    free(req);
+}
+
+
+static const struct lsquic_hset_if header_bypass_api =
+{
+    .hsi_create_header_set  = interop_server_hset_create,
+    .hsi_prepare_decode     = interop_server_hset_prepare_decode,
+    .hsi_process_header     = interop_server_hset_add_header,
+    .hsi_discard_header_set = interop_server_hset_destroy,
+};
+
 int main(int argc, char** argv) {
-    // struct lsquic_engine_api engine_api;
-    // struct lsquic_engine_settings settings;
-    // struct server_ctx server_ctx;
     int sockfd;
 
     log_file = stderr;
@@ -727,37 +977,43 @@ int main(int argc, char** argv) {
 
     argument_parser(argc, argv);
 
-    if (!(cert_file && key_file)) {
-        LOG("Specify both cert (-c) and key (-k) files");
-        exit(EXIT_FAILURE);
-    }
+    // if (!(cert_file && key_file)) {
+    //     LOG("Specify both cert (-c) and key (-k) files");
+    //     exit(EXIT_FAILURE);
+    // }
     
-    if (0 != server_load_cert(cert_file, key_file)) {
-        LOG("Cannot load certificate");
-        exit(EXIT_FAILURE);
-    }
+    // if (0 != server_load_cert(cert_file, key_file)) {
+    //     LOG("Cannot load certificate");
+    //     exit(EXIT_FAILURE);
+    // }
 
     if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER)) {
         fprintf(stderr, "Global init failed\n");
         exit(EXIT_FAILURE);
     }
 
+    setvbuf(log_file, NULL, _IOLBF, 0);
+    lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
+                                                                   
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     memset(&server_ctx, 0, sizeof(server_ctx));
     memset(&engine_api, 0, sizeof(engine_api));
     
     lsquic_engine_init_settings(&settings, LSENG_SERVER|LSENG_HTTP);
-    // settings.es_ql_bits = 0;
+    settings.es_versions = LSQUIC_DF_VERSIONS;
 
     if (0 != lsquic_engine_check_settings(&settings, LSENG_SERVER|LSENG_HTTP, errbuf, sizeof(errbuf))) {
         LOG("invalid settings: %s", errbuf);
         exit(EXIT_FAILURE);
     }
 
+
     if (((server_ctx.sockfd) = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
-    sockfd = server_ctx.sockfd;
 
     if (0 != server_set_nonblocking((server_ctx.sockfd)))
     {
@@ -774,42 +1030,37 @@ int main(int argc, char** argv) {
     struct sockaddr_in *const sa4 = (void *) &(server_ctx.local_sas);
 
     sa4->sin_family = AF_INET;
-    sa4->sin_addr.s_addr = inet_addr("192.168.200.194");
-    sa4->sin_port = 51813;
+    sa4->sin_addr.s_addr = inet_addr("192.168.122.51");
+    sa4->sin_port = htons(443);
 
-    if (0 != bind(sockfd, (struct sockaddr *)&(server_ctx.local_sas), sizeof((server_ctx.local_sas))))
+    if (0 != bind(server_ctx.sockfd, (struct sockaddr *)&(server_ctx.local_sas), sizeof((server_ctx.local_sas))))
     {
         perror("bind");
         exit(EXIT_FAILURE);
     }
 
-    getsockname((server_ctx.sockfd), (struct sockaddr *)&(local_sa), sizeof(local_sa));
-    fprintf(stderr, "bound to port:%d, sockfd:%d\n", local_sa.sin_port, sockfd);
+    fprintf(stderr, "bound to port:%d, sockfd:%d\n", (int)(sa4->sin_port), server_ctx.sockfd);
 
-    setvbuf(log_file, NULL, _IOLBF, 0);
-    lsquic_logger_init(&logger_if, log_file, LLTS_HHMMSSUS);
-
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
+    engine_api.ea_settings = &settings;
     engine_api.ea_packets_out = send_packets_out;
     engine_api.ea_packets_out_ctx = &server_ctx;
     engine_api.ea_stream_if = &my_server_callbacks;
     engine_api.ea_stream_if_ctx = &server_ctx;
-    engine_api.ea_get_ssl_ctx   = my_server_get_ssl_ctx;
+    // engine_api.ea_get_ssl_ctx   = my_server_get_ssl_ctx;
+    engine_api.ea_lookup_cert = lookup_cert;
+    engine_api.ea_cert_lu_ctx = prog_certs;
+    engine_api.ea_hsi_if = &header_bypass_api;
+    engine_api.ea_hsi_ctx = NULL;
     /* TODO
      * set ea_lookup_cert
-     * set ea_cert_lu_ctx */
-
-    // if (key_log_dir)
-    // {
-    //     engine_api.ea_keylog_if = keylog_if;
-    //     engine_api.ea_keylog_ctx = (void *) key_log_dir;
-    // }
-    engine_api.ea_settings = &settings;
+     * set ea_cert_lu_ctx 
+     * set keylog_dir */
 
     server_ctx.server_eb = event_base_new();
-
+    if (!server_ctx.server_eb) {
+        perror("Couldn't create event base");
+	exit(EXIT_FAILURE);
+    }
     server_ctx.engine = lsquic_engine_new(LSENG_SERVER|LSENG_HTTP, &engine_api);
     if (!server_ctx.engine) {
         fprintf(stderr, "cannot create engine\n");
